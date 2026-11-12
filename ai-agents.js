@@ -124,7 +124,12 @@
 
   // ─── Persistence ───────────────────────────────────────────
   function save() {
-    writeJson(STORAGE.agents, state.agents);
+    const safeAgents = state.agents.map((agent) => {
+      const { apiKey, ...safeAgent } = agent;
+      return safeAgent;
+    });
+    writeJson(STORAGE.agents, safeAgents);
+    localStorage.removeItem(LEGACY.key);
     localStorage.setItem(STORAGE.active, state.active);
     localStorage.setItem(STORAGE.mode, state.mode);
     writeJson(STORAGE.compare, state.compare);
@@ -352,13 +357,81 @@
     actions.appendChild(applyBtn);
   }
 
+  // ─── Safe Markdown rendering ─────────────────────────────────
+  const MARKDOWN_ALLOWED_TAGS = new Set([
+    'a', 'blockquote', 'br', 'code', 'del', 'em', 'h1', 'h2', 'h3',
+    'h4', 'h5', 'h6', 'hr', 'li', 'ol', 'p', 'pre', 's', 'span',
+    'strong', 'sub', 'sup', 'table', 'tbody', 'td', 'th', 'thead',
+    'tr', 'ul'
+  ]);
+  const MARKDOWN_DROP_TAGS = new Set([
+    'base', 'button', 'embed', 'form', 'iframe', 'input', 'link',
+    'math', 'meta', 'object', 'option', 'script', 'select', 'style',
+    'svg', 'template', 'textarea', 'video', 'audio', 'source'
+  ]);
+
+  function sanitizeMarkdownHtml(markup) {
+    const parsed = new DOMParser().parseFromString(String(markup), 'text/html');
+
+    function cleanNode(node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        return document.createTextNode(node.nodeValue || '');
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) {
+        return document.createDocumentFragment();
+      }
+
+      const tag = node.tagName.toLowerCase();
+      if (MARKDOWN_DROP_TAGS.has(tag)) return document.createDocumentFragment();
+
+      if (!MARKDOWN_ALLOWED_TAGS.has(tag)) {
+        const fragment = document.createDocumentFragment();
+        Array.from(node.childNodes).forEach((child) => fragment.appendChild(cleanNode(child)));
+        return fragment;
+      }
+
+      const clean = document.createElement(tag);
+      if (tag === 'a') {
+        const rawHref = node.getAttribute('href') || '';
+        try {
+          const safeUrl = new URL(rawHref, window.location.href);
+          if (['https:', 'http:', 'mailto:'].includes(safeUrl.protocol)) {
+            clean.setAttribute('href', safeUrl.href);
+            clean.setAttribute('target', '_blank');
+            clean.setAttribute('rel', 'noopener noreferrer');
+          }
+        } catch (error) {
+          // Render the link text without a clickable destination.
+        }
+        const title = node.getAttribute('title');
+        if (title) clean.setAttribute('title', title.slice(0, 300));
+      } else if (tag === 'code') {
+        const languageClass = Array.from(node.classList).find((name) =>
+          /^language-[a-zA-Z0-9_-]{1,40}$/.test(name)
+        );
+        if (languageClass) clean.className = languageClass;
+      } else if (tag === 'td' || tag === 'th') {
+        const align = node.getAttribute('align');
+        if (['left', 'center', 'right'].includes(align)) clean.setAttribute('align', align);
+      }
+
+      Array.from(node.childNodes).forEach((child) => clean.appendChild(cleanNode(child)));
+      return clean;
+    }
+
+    const fragment = document.createDocumentFragment();
+    Array.from(parsed.body.childNodes).forEach((child) => fragment.appendChild(cleanNode(child)));
+    return fragment;
+  }
+
   // ─── Message rendering ─────────────────────────────────────
   function renderMessage(role, value, meta) {
   const container = get('aiMessages');
   if (!container) return null;
   
   const div = document.createElement('div');
-  div.className = 'ai-msg ai-' + role;
+  const safeRole = ['user', 'assistant', 'system'].includes(role) ? role : 'assistant';
+  div.className = 'ai-msg ai-' + safeRole;
   if (meta?.error) div.classList.add('ai-error-card');
   
   if (meta?.agent) {
@@ -372,7 +445,7 @@
   if (typeof window.marked !== 'undefined' && typeof window.hljs !== 'undefined') {
     const contentDiv = document.createElement('div');
     contentDiv.className = 'ai-md-content';
-    contentDiv.innerHTML = window.marked.parse(text(value));
+    contentDiv.appendChild(sanitizeMarkdownHtml(window.marked.parse(text(value))));
     
     // Inject Apply buttons into code blocks
     contentDiv.querySelectorAll('pre code').forEach((codeEl) => {
@@ -496,36 +569,31 @@
   }
 
   async function runSingle(prompt, agents) {
-    const agent = agents[0];
-    const retry = () => runSingle(prompt, agents);
-    await runAgent(prompt, agent, { retry });
+    const groupId = makeId();
+    return window.IDEditorCore.orchestrateAgents('single', prompt, agents,
+      (stepPrompt, agent) => runAgent(stepPrompt, agent, {
+        groupId,
+        retry: () => runSingle(prompt, agents)
+      }));
   }
-
   async function runParallel(prompt, agents) {
     const groupId = makeId();
-    const jobs = agents.map((agent) => runAgent(prompt, agent, {
-      groupId,
-      retry: () => runAgent(prompt, agent, { groupId })
-    }));
-    await Promise.all(jobs);
+    return window.IDEditorCore.orchestrateAgents('parallel', prompt, agents,
+      (stepPrompt, agent) => runAgent(stepPrompt, agent, {
+        groupId,
+        retry: () => runAgent(stepPrompt, agent, { groupId })
+      }));
   }
-
   async function runPipeline(prompt, agents, startIndex, previousOutput) {
-    startIndex = startIndex || 0;
     const groupId = makeId();
-    let previous = previousOutput || '';
-    for (let i = startIndex; i < agents.length; i++) {
-      const agent = agents[i];
-      const stepPrompt = i === 0
-        ? prompt
-        : 'Previous agent (' + agents[i - 1].name + ' via ' + providerLabel(agents[i - 1].provider) + ') produced:\n\n'
-          + previous + '\n\nNow improve/fix/complete this:\n' + prompt;
-      const retry = () => runPipeline(prompt, agents, i, previous);
-      const result = await runAgent(stepPrompt, agent, { groupId, retry });
-      if (!result.ok) return;
-      previous = result.result;
-      if (i < agents.length - 1) appendPipelineDivider(agents[i + 1].name);
-    }
+    return window.IDEditorCore.orchestrateAgents('pipeline', prompt, agents,
+      (stepPrompt, agent, index, previous) => runAgent(stepPrompt, agent, {
+        groupId,
+        retry: () => runPipeline(prompt, agents, index, previous)
+      }),
+      appendPipelineDivider,
+      startIndex,
+      previousOutput);
   }
 
   function appendPipelineDivider(nextAgentName) {
@@ -558,7 +626,7 @@
       else if (state.mode === 'parallel') await runParallel(prompt, agents);
       else if (state.mode === 'pipeline') await runPipeline(prompt, agents);
     } catch (e) {
-      // individual agent failures already rendered
+      renderMessage('system', 'AI orchestration failed: ' + (e.message || String(e)));
     }
   }
 
@@ -856,6 +924,10 @@
       }
 
       if (key === 'model') input.setAttribute('list', datalistId);
+      if (key === 'apiKey') {
+        input.autocomplete = 'off';
+        input.placeholder = 'Enter API key (kept in memory only)';
+      }
       if (key === 'temperature') { input.min = 0; input.max = 2; input.step = 0.1; }
       if (key === 'maxTokens') input.min = 1;
 
@@ -894,6 +966,11 @@
       formState.provider = inputs.provider.value;
       refreshDatalist();
     };
+
+    const credentialNote = document.createElement('p');
+    credentialNote.className = 'ai-credential-note';
+    credentialNote.textContent = 'API keys are kept in memory for this tab only. They are removed from saved settings and must be re-entered after a refresh.';
+    form.appendChild(credentialNote);
 
     const buttons = document.createElement('div');
     const test = document.createElement('button');

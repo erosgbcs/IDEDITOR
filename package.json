@@ -1,5 +1,9 @@
 {
   "name": "ideditor",
   "version": "1.0.0",
-  "private": true
+  "private": true,
+  "scripts": {
+    "check": "node --check editor-core.js && node --check project-storage.js && node --check script.js && node --check ai-agents.js && node --test",
+    "test": "node --test"
+  }
 }

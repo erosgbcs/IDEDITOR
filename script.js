@@ -20,8 +20,11 @@ const THEME_KEY    = 'idEditor.theme';
 const FONTSIZE_KEY = 'idEditor.fontSize';
 const SIDEBAR_KEY  = 'idEditor.sidebarHidden';
 const GIT_URL_KEY  = 'idEditor.gitRepo';
-const GIT_TOKEN_KEY = 'idEditor.gitToken';
-const GIT_BRANCH_KEY = 'idEditor.gitBranch';
+const GIT_TOKEN_KEY = 'idEditor.gitToken'; // Legacy key; removed during migration.
+let volatileGitToken = '';
+try { localStorage.removeItem(GIT_TOKEN_KEY); } catch (error) { /* Storage may be unavailable. */ }
+const GIT_BRANCH_KEY = 'idEditor.gitBranch'; // Legacy global preference; project tracking replaces it.
+try { localStorage.removeItem(GIT_BRANCH_KEY); } catch (error) { /* Storage may be unavailable. */ }
 const MINIMAP_KEY = 'idEditor.minimap';
 
 // AI Storage Keys
@@ -31,23 +34,21 @@ const AI_MODEL_KEY    = 'idEditor.aiModel';
 
 let currentProjectId = null;
 let projectsData = {};
+let projectStorage = null;
+let projectStorageWarningShown = false;
+const pendingProjectWrites = new Map();
 
 /* =========================================================
    PROJECT MANAGEMENT LOGIC
    ========================================================= */
 function generateId() { return 'p_' + Date.now().toString(36) + Math.random().toString(36).substr(2, 5); }
 
-function loadProjectsData() {
-  try {
-    const raw = localStorage.getItem(PROJECTS_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && parsed.projects) {
-        projectsData = parsed.projects;
-        currentProjectId = parsed.currentProjectId;
-      }
-    }
-  } catch (e) { console.warn('Failed to load projects', e); }
+async function loadProjectsData() {
+  projectStorage = new window.IDEditorProjectStorage();
+  const loaded = await projectStorage.open();
+  projectsData = loaded.projects || {};
+  currentProjectId = loaded.currentProjectId || null;
+  let createdDefaultProject = false;
 
   if (!projectsData || Object.keys(projectsData).length === 0) {
     const id = generateId();
@@ -59,32 +60,99 @@ function loadProjectsData() {
       }
     };
     currentProjectId = id;
-    saveProjectsToStorage();
+    createdDefaultProject = true;
   } else if (!currentProjectId || !projectsData[currentProjectId]) {
     currentProjectId = Object.keys(projectsData)[0];
   }
 
+  Object.keys(projectsData).forEach((id) => {
+    const project = projectsData[id];
+    project.files = window.IDEditorCore.normalizeProjectFiles(project.files || {});
+  });
   FILES = projectsData[currentProjectId].files;
   filesList = Object.keys(FILES);
+
+  if (createdDefaultProject) await saveProjectsToStorage([currentProjectId]);
+  else await projectStorage.setCurrentProjectId(currentProjectId);
+  return { mode: projectStorage.mode, warning: projectStorage.lastError };
 }
 
-function saveProjectsToStorage() {
-  try {
-    localStorage.setItem(PROJECTS_KEY, JSON.stringify({
-      currentProjectId: currentProjectId,
-      projects: projectsData
-    }));
-  } catch (e) { console.warn('Failed to save projects', e); }
+function handleProjectStorageError(error) {
+  console.error('[IDEDITOR] Project storage failed:', error);
+  if (!projectStorageWarningShown) {
+    projectStorageWarningShown = true;
+    showToast('Project storage failed. Export your work before closing or refreshing.');
+  }
+  return false;
+}
+
+function saveProjectsToStorage(projectIds) {
+  if (!projectStorage) return Promise.resolve(false);
+  const ids = Array.isArray(projectIds) ? [...new Set(projectIds)] : [currentProjectId];
+  const validIds = ids.filter(id => id && projectsData[id]);
+  if (!validIds.length) {
+    return projectStorage.setCurrentProjectId(currentProjectId).catch(handleProjectStorageError);
+  }
+
+  // Snapshot and enqueue every selected project immediately. Deferring the
+  // saveProject calls to a Promise callback could let a deletion enqueue first
+  // and then accidentally recreate the deleted record afterward.
+  const writes = validIds.map(id => projectStorage.saveProject(
+    id,
+    projectsData[id],
+    id === currentProjectId ? currentProjectId : undefined
+  ));
+  return Promise.all(writes).then(results => {
+    if (results.some(saved => saved === false)) {
+      return handleProjectStorageError(new Error('No persistent browser storage is available.'));
+    }
+    return true;
+  }).catch(handleProjectStorageError);
 }
 
 function saveCurrentProjectFiles() {
-  if (!currentProjectId || !projectsData[currentProjectId]) return;
-  const data = {};
-  Object.keys(models).forEach(k => { data[k] = models[k].getValue(); savedSnapshot[k] = data[k]; });
-  projectsData[currentProjectId].files = data;
-  projectsData[currentProjectId].updatedAt = Date.now();
-  saveProjectsToStorage();
-  hasPendingSave = false; Object.keys(models).forEach(markDirtyState);
+  if (!currentProjectId || !projectsData[currentProjectId]) return Promise.resolve(false);
+  const projectId = currentProjectId;
+  // Keep the workspace file map as the source of truth. Only loaded Monaco
+  // models need synchronization; unloaded files remain intact on autosave.
+  const data = FILES && currentProjectId === projectId
+    ? FILES
+    : (projectsData[projectId].files || {});
+  Object.keys(models).forEach(k => {
+    if (!Object.prototype.hasOwnProperty.call(data, k)) return;
+    const content = models[k].getValue();
+    data[k] = { lang: models[k].getLanguageId() || langFromFilename(k), content };
+    savedSnapshot[k] = content;
+  });
+  projectsData[projectId].files = data;
+  if (currentProjectId === projectId) FILES = data;
+  projectsData[projectId].updatedAt = Date.now();
+  hasPendingSave = false;
+  Object.keys(models).forEach(markDirtyState);
+
+  if (!projectStorage) return Promise.resolve(false);
+  // Track writes so cloud imports can distinguish a clean project from one
+  // whose latest edits have not yet committed to IndexedDB.
+  pendingProjectWrites.set(projectId, (pendingProjectWrites.get(projectId) || 0) + 1);
+  // Autosave must not change the persisted active-project selection. A
+  // deliberate project switch updates that metadata through saveProjectsToStorage.
+  return projectStorage.saveProject(projectId, projectsData[projectId]).then(saved => {
+    if (saved === false) {
+      if (currentProjectId === projectId) hasPendingSave = true;
+      return handleProjectStorageError(new Error('No persistent browser storage is available.'));
+    }
+    return true;
+  }).catch(error => {
+    if (currentProjectId === projectId) {
+      hasPendingSave = true;
+      Object.keys(models).forEach(markDirtyState);
+    }
+    return handleProjectStorageError(error);
+  }).finally(() => {
+    const remaining = (pendingProjectWrites.get(projectId) || 1) - 1;
+    if (remaining > 0) pendingProjectWrites.set(projectId, remaining);
+    else pendingProjectWrites.delete(projectId);
+  });
 }
 
 function renderProjectsDashboard() {
@@ -139,17 +207,36 @@ function renderProjectsDashboard() {
 }
 
 function deleteProject(id) {
+  if (!Object.prototype.hasOwnProperty.call(projectsData, id)) return;
+  const wasActive = currentProjectId === id;
+  if (wasActive) saveCurrentProjectFiles();
   delete projectsData[id];
-  if (currentProjectId === id) {
-    currentProjectId = Object.keys(projectsData)[0];
-    if (currentProjectId) switchProject(currentProjectId);
-    else location.reload();
+  // Queue the record deletion before saving the replacement active project.
+  if (projectStorage) {
+    projectStorage.deleteProject(id, wasActive ? null : currentProjectId).catch(handleProjectStorageError);
+  }
+
+  if (wasActive) {
+    // Prevent switchProject from saving the deleted project's models into its replacement.
+    currentProjectId = null;
+    const nextId = window.IDEditorCore.nextProjectIdAfterRemoval(projectsData, id);
+    if (nextId) switchProject(nextId);
+    else {
+      const replacementId = generateId();
+      projectsData[replacementId] = {
+        name: 'My First Project',
+        files: JSON.parse(JSON.stringify(DEFAULT_FILES)),
+        updatedAt: Date.now()
+      };
+      switchProject(replacementId);
+    }
   }
   saveProjectsToStorage();
   renderProjectsDashboard();
 }
 
 function switchProject(id) {
+  if (!projectsData[id]) return;
   saveCurrentProjectFiles();
   currentProjectId = id;
   const proj = projectsData[id];
@@ -165,14 +252,14 @@ function switchProject(id) {
     FILES['index.html'] = { lang: 'html', content: DEFAULT_HTML };
     filesList.push('index.html');
   }
-  filesList.forEach(ensureModel);
-  
   activeFile = filesList[0];
+  ensureModel(activeFile);
   renderTabs(); renderSidebarFiles(); switchFile(activeFile);
   saveProjectsToStorage();
   
   closeProjectsDashboard();
   showToast(`Switched to ${proj.name}`);
+  updateGitStatus();
 }
 
 function createNewProject(name = 'Untitled Project') {
@@ -203,33 +290,34 @@ function wireProjectsUI() {
     if (name && name.trim()) createNewProject(name.trim());
   });
 
-  document.getElementById('btnDashboardCloneProject').addEventListener('click', () => {
+  document.getElementById('btnDashboardCloneProject').addEventListener('click', async () => {
     const url = prompt('Enter GitHub Repository URL (e.g., https://github.com/octocat/Hello-World.git):');
     if (!url || !url.trim()) return;
-    
-    const token = localStorage.getItem(GIT_TOKEN_KEY);
-    if (!token) {
-      alert('You need a Personal Access Token (PAT) to clone. Please set it in the Git Settings (Gear icon in sidebar) first.');
-      return;
-    }
+    const normalizedUrl = url.trim();
+    const parsed = parseGitHubUrl(normalizedUrl);
+    if (!parsed) return showToast('Enter a valid HTTPS GitHub repository URL');
 
-    const repoName = url.split('/').pop().replace('.git', '');
-    const newProjName = prompt('Enter project name for the clone:', repoName);
-    if (!newProjName) return;
+    const newProjName = prompt('Enter project name for the clone:', parsed.repo);
+    if (!newProjName || !newProjName.trim()) return;
 
-    const id = generateId();
-    projectsData[id] = { name: newProjName, files: {}, updatedAt: Date.now() };
-    switchProject(id);
+    // Public repositories can be cloned without a PAT. Private repositories use
+    // the volatile token configured in Git Settings.
+    localStorage.setItem(GIT_URL_KEY, normalizedUrl);
+    createNewProject(newProjName.trim());
+    setCurrentProjectRemoteUrl(normalizedUrl);
+    document.getElementById('gitRepoUrl').value = normalizedUrl;
+    await updateGitStatus();
     closeProjectsDashboard();
-    
-    localStorage.setItem(GIT_URL_KEY, url);
-    document.getElementById('gitRepoUrl').value = url;
-    
     bottomPanel.classList.remove('hidden');
     setActivePanel('terminal');
-    addTermLine(`$ git clone ${url}`, '');
-    
-    gitClone().then(() => addTermLine('Clone successful', 'success')).catch(err => addTermLine('Clone failed: ' + err.message, 'error'));
+    addTermLine('$ git clone ' + normalizedUrl, '');
+    try {
+      const cloned = await gitClone({ replace: true });
+      if (cloned) addTermLine('Clone successful', 'success');
+    } catch (error) {
+      addTermLine('Clone failed: ' + (error.message || error), 'error');
+      showToast('Clone failed: ' + (error.message || 'Unknown error'));
+    }
   });
 }
 
@@ -316,11 +404,15 @@ async function saveToCloud() {
   if (!firebaseEnabled || !fbUser) return showToast('Login to save to cloud');
   try {
     showToast('Saving to cloud...');
-    saveCurrentProjectFiles();
+    const projectId = currentProjectId;
+    const project = currentProject();
+    if (!project) return showToast('No active project');
+    const savedLocally = await saveCurrentProjectFiles();
+    if (!savedLocally) return showToast('Local save failed. Cloud save was cancelled to protect your project.');
     const { doc, setDoc } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js');
-    await setDoc(doc(fbDb, 'users', fbUser.uid, 'projects', currentProjectId), {
-      name: projectsData[currentProjectId].name,
-      files: projectsData[currentProjectId].files,
+    await setDoc(doc(fbDb, 'users', fbUser.uid, 'projects', projectId), {
+      name: project.name,
+      files: project.files,
       updatedAt: new Date().toISOString()
     });
     showToast('Saved to cloud!'); addTermLine('Project saved to cloud!', 'success');
@@ -334,36 +426,76 @@ async function loadFromCloud() {
     const { collection, getDocs } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js');
     const querySnapshot = await getDocs(collection(fbDb, 'users', fbUser.uid, 'projects'));
     if (querySnapshot.empty) return showToast('No cloud projects found');
-    
-    let newProjects = { ...projectsData };
+
+    const activeId = currentProjectId;
+    const activeProject = currentProject();
+    const activeFiles = activeId ? collectWorkspaceFiles() : {};
+    const persistedActiveFiles = {};
+    Object.entries(activeProject && activeProject.files || {}).forEach(([path, file]) => {
+      persistedActiveFiles[path] = typeof file === 'string' ? file : (file && file.content != null ? String(file.content) : '');
+    });
+    const activeHasUnsavedChanges = Boolean(activeId && (
+      hasPendingSave ||
+      (pendingProjectWrites.get(activeId) || 0) > 0 ||
+      !window.IDEditorCore.sameFileSnapshots(activeFiles, persistedActiveFiles)
+    ));
+    let newProjects = { ...projectsData }, activeCloudFiles = null, skippedLocalWork = false;
+    const importedProjectIds = [];
     querySnapshot.forEach((docSnap) => {
       const data = docSnap.data();
+      const normalizedFiles = window.IDEditorCore.normalizeProjectFiles(data.files || {});
+      const isActive = docSnap.id === activeId;
+      if (!window.IDEditorCore.shouldApplyCloudProject(isActive, activeHasUnsavedChanges, Boolean(activeProject && activeProject.pendingCommit))) {
+        skippedLocalWork = true;
+        return;
+      }
+      const parsedDate = Date.parse(data.updatedAt || '');
+      const localProject = newProjects[docSnap.id] || {};
       newProjects[docSnap.id] = {
-        name: data.name || 'Cloud Project',
-        files: data.files || {},
-        updatedAt: new Date(data.updatedAt).getTime() || Date.now()
+        ...localProject,
+        name: data.name || localProject.name || 'Cloud Project',
+        files: normalizedFiles,
+        updatedAt: Number.isFinite(parsedDate) ? parsedDate : Date.now()
       };
+      importedProjectIds.push(docSnap.id);
+      if (isActive) {
+        activeCloudFiles = {};
+        Object.entries(normalizedFiles).forEach(([path, file]) => { activeCloudFiles[path] = file.content; });
+      }
     });
     projectsData = newProjects;
-    saveProjectsToStorage();
+    if (activeCloudFiles) applyWorkspaceFiles(activeCloudFiles);
+    saveProjectsToStorage(importedProjectIds);
     renderProjectsDashboard();
-    showToast('Cloud projects loaded! Check Dashboard.');
-  } catch (e) { showToast('Cloud load failed'); }
+    showToast(skippedLocalWork
+      ? 'Cloud projects loaded. Projects with unsaved or staged work kept their local version.'
+      : 'Cloud projects loaded! Check Dashboard.');
+  } catch (e) {
+    console.error('Cloud load failed:', e);
+    showToast('Cloud load failed; local workspace was preserved.');
+  }
 }
 
 async function loadGitSettingsFromCloud(uid) {
   try {
-    const { doc, getDoc } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js');
-    const docSnap = await getDoc(doc(fbDb, 'users', uid, 'settings', 'git'));
+    const { doc, getDoc, updateDoc, deleteField } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js');
+    const settingsRef = doc(fbDb, 'users', uid, 'settings', 'git');
+    const docSnap = await getDoc(settingsRef);
     if (docSnap.exists()) {
       const data = docSnap.data();
       if (data.url) localStorage.setItem(GIT_URL_KEY, data.url);
-      if (data.token) localStorage.setItem(GIT_TOKEN_KEY, data.token);
+      if (Object.prototype.hasOwnProperty.call(data, 'token')) {
+        try { await updateDoc(settingsRef, { token: deleteField() }); } catch (cleanupError) {
+          console.warn('Legacy Firebase Git token cleanup could not complete.');
+        }
+      }
       document.getElementById('gitRepoUrl').value = data.url || '';
-      document.getElementById('gitToken').value = data.token || '';
+      document.getElementById('gitToken').value = volatileGitToken;
       updateGitStatus();
     }
-  } catch (e) { console.warn('Failed to load Git settings'); }
+  } catch (error) {
+    console.warn('Failed to load Git settings');
+  }
 }
 
 /* =========================================================
@@ -382,7 +514,13 @@ function parserForFile(name) {
   return { html: 'html', htm: 'html', css: 'css', js: 'babel', mjs: 'babel', jsx: 'babel', ts: 'typescript', tsx: 'typescript', json: 'json', md: 'markdown' }[ext] || null;
 }
 
-loadProjectsData();
+if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js').catch((error) => {
+      console.warn('[IDEDITOR] Offline cache registration unavailable:', error && error.message);
+    });
+  });
+}
 document.documentElement.setAttribute('data-theme', (localStorage.getItem(THEME_KEY) === 'vs' || localStorage.getItem(THEME_KEY) === 'light') ? 'light' : 'dark');
 
 /* =========================================================
@@ -416,19 +554,39 @@ let activeFile = 'index.html', uriSeq = 0;
 let minimapEnabled = localStorage.getItem(MINIMAP_KEY) === 'true';
 let fontSize = parseInt(localStorage.getItem(FONTSIZE_KEY), 10) || (isMobile() ? 14 : 13);
 
-if (typeof require === 'undefined') {
-  document.getElementById('editor').innerHTML = '<div style="padding:20px;color:#ff7b72;font-family:sans-serif">Failed to load Monaco Editor.</div>';
-} else {
-  require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
-  require(['vs/editor/editor.main'], initEditor);
+async function bootEditorAfterStorage() {
+  try {
+    const storageState = await loadProjectsData();
+    if (storageState.mode === 'localStorage-fallback') {
+      showToast('IndexedDB unavailable. Using limited local storage fallback.');
+    } else if (storageState.mode === 'memory-fallback') {
+      showToast('Persistent browser storage unavailable. Changes may not survive refresh.');
+    }
+
+    if (typeof require === 'undefined') {
+      document.getElementById('editor').innerHTML = '<div style="padding:20px;color:#ff7b72;font-family:sans-serif">Failed to load Monaco Editor.</div>';
+      return;
+    }
+    require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
+    require(['vs/editor/editor.main'], initEditor);
+  } catch (error) {
+    console.error('[IDEDITOR] Workspace startup failed:', error);
+    const host = document.getElementById('editor');
+    if (host) {
+      host.innerHTML = '<div style="padding:20px;color:#ff7b72;font-family:sans-serif">Unable to open your saved workspace. Your existing data was not reset. Close other IDEDITOR tabs and reload, or export the legacy backup if available.</div>';
+    }
+    showToast('Workspace storage unavailable. Existing project data was not reset.');
+  }
 }
+bootEditorAfterStorage();
 
 function makeUri(name) { return monaco.Uri.parse('inmemory:///' + encodeURIComponent(name) + '/' + (++uriSeq)); }
 
 function ensureModel(name) {
   if (models[name]) return models[name];
-  const meta = FILES[name];
-  const model = monaco.editor.createModel(meta ? meta.content : '', meta ? meta.lang : langFromFilename(name), makeUri(name));
+  const rawMeta = FILES[name];
+  const meta = typeof rawMeta === 'string' ? { content: rawMeta, lang: langFromFilename(name) } : (rawMeta || {});
+  const model = monaco.editor.createModel(meta.content == null ? '' : meta.content, meta.lang || langFromFilename(name), makeUri(name));
   models[name] = model;
   savedSnapshot[name] = model.getValue();
   model.onDidChangeContent(() => { markDirtyState(name); scheduleSave(); });
@@ -441,7 +599,7 @@ function initEditor() {
   
   if (!filesList.length) filesList = ['index.html'];
   if (!filesList.includes(activeFile)) activeFile = filesList[0];
-  filesList.forEach(ensureModel);
+  ensureModel(activeFile);
 
   editor = monaco.editor.create(document.getElementById('editor'), {
     model: models[activeFile], theme: currentTheme, fontSize: fontSize,
@@ -457,8 +615,6 @@ function initEditor() {
 
   renderTabs(); renderSidebarFiles();
   wireFindBar(); wireRun(); wireConsole(); wireClipboard(); wireSettings(); wirePreviewControls(); wireSidebar(); wireMobileActions(); wireTier1Features(); setupSaveFlush(); wireGitUI(); wireProjectsUI(); wireAI();
-  Object.values(models).forEach(m => window.__hookAutoRun && window.__hookAutoRun(m));
-
   editor.addAction({ id: 'custom-open-find', label: 'Find', keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF], run: openFindBar });
   editor.addAction({ id: 'custom-run-kb', label: 'Run', keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter], run: run });
 
@@ -468,7 +624,12 @@ function initEditor() {
 }
 
 document.addEventListener('keydown', e => {
-  if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); saveCurrentProjectFiles(); showToast('Project Saved'); }
+  if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+    e.preventDefault();
+    saveCurrentProjectFiles().then(saved => {
+      if (saved) showToast('Project Saved');
+    });
+  }
 });
 
 function wireTier1Features() {
@@ -491,8 +652,9 @@ function wireTier1Features() {
       if (models[file.name]) { models[file.name].dispose(); delete models[file.name]; }
       FILES[file.name] = { lang: langFromFilename(file.name), content: await file.text() };
       if (!filesList.includes(file.name)) filesList.push(file.name);
-      ensureModel(file.name); if (!firstImported) firstImported = file.name;
+      if (!firstImported) firstImported = file.name;
     }
+    if (firstImported) ensureModel(firstImported);
     renderTabs(); renderSidebarFiles(); if (firstImported) switchFile(firstImported);
     saveCurrentProjectFiles(); showToast('Imported files'); e.target.value = '';
   });
@@ -532,92 +694,176 @@ function wireTier1Features() {
    STATUS, SAVE, RENDER
    ========================================================= */
 function updateStatusFont() { const el = document.getElementById('statusFont'); if (el) el.textContent = fontSize + 'px'; }
-function findTabEl(name) { return Array.from(document.querySelectorAll('.tab')).find(t => t.dataset.file === name) || null; }
-function findSideItemEl(name) { return Array.from(document.querySelectorAll('.side-item[data-file]')).find(t => t.dataset.file === name) || null; }
+
+const tabElements = new Map();
+const sidebarFileElements = new Map();
+function findTabEl(name) { return tabElements.get(name) || null; }
+function findSideItemEl(name) { return sidebarFileElements.get(name) || null; }
 
 function markDirtyState(file) {
-  const dirty = (savedSnapshot[file] || '') !== (models[file] ? models[file].getValue() : '');
-  const tab = findTabEl(file); if (tab) tab.classList.toggle('dirty', dirty);
-  const item = findSideItemEl(file); if (item) item.classList.toggle('dirty', dirty);
+  const currentContent = models[file] ? models[file].getValue() : readProjectFile(file);
+  const baseline = Object.prototype.hasOwnProperty.call(savedSnapshot, file)
+    ? savedSnapshot[file]
+    : currentContent;
+  const dirty = baseline !== currentContent;
+  const tab = findTabEl(file);
+  const item = findSideItemEl(file);
+  if (tab) tab.classList.toggle('dirty', dirty);
+  if (item) item.classList.toggle('dirty', dirty);
 }
 
-let saveTimer = null, hasPendingSave = false;
-function scheduleSave() { hasPendingSave = true; clearTimeout(saveTimer); saveTimer = setTimeout(saveCurrentProjectFiles, 500); }
+let saveTimer = null, hasPendingSave = false, sidebarRenderTimer = null;
+function scheduleSave() {
+  hasPendingSave = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveCurrentProjectFiles, 650);
+}
+function scheduleSidebarRender() {
+  clearTimeout(sidebarRenderTimer);
+  sidebarRenderTimer = setTimeout(() => {
+    sidebarRenderTimer = null;
+    renderSidebarFiles();
+  }, 90);
+}
 function setupSaveFlush() {
-  document.addEventListener('visibilitychange', () => { if (document.hidden && hasPendingSave) saveCurrentProjectFiles(); });
-  window.addEventListener('beforeunload', () => { if (hasPendingSave) saveCurrentProjectFiles(); });
+  const flushPendingProjectSave = () => {
+    if (hasPendingSave) saveCurrentProjectFiles();
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) flushPendingProjectSave();
+  });
+  window.addEventListener('pagehide', flushPendingProjectSave);
+  window.addEventListener('beforeunload', flushPendingProjectSave);
 }
 
 function renderTabs() {
-  const nav = document.getElementById('tabs'); nav.innerHTML = '';
+  const nav = document.getElementById('tabs');
+  const fragment = document.createDocumentFragment();
+  tabElements.clear();
   filesList.forEach(name => {
     const btn = document.createElement('button');
     btn.className = 'tab' + (name === activeFile ? ' active' : '');
-    btn.dataset.file = name; btn.textContent = basename(name); btn.title = name;
-    attachFileMenuHandlers(btn, name); nav.appendChild(btn);
+    btn.dataset.file = name;
+    btn.textContent = basename(name);
+    btn.title = name;
+    attachFileMenuHandlers(btn, name);
+    tabElements.set(name, btn);
+    fragment.appendChild(btn);
   });
-  
-  // Preview tab removed — preview is triggered via Run button or file context menu
 
-  const addBtn = document.createElement('button'); addBtn.className = 'tab-add'; addBtn.title = 'New file'; addBtn.textContent = '+';
-  addBtn.addEventListener('click', promptNewFile); nav.appendChild(addBtn);
-  filesList.forEach(markDirtyState);
+  const addBtn = document.createElement('button');
+  addBtn.className = 'tab-add';
+  addBtn.title = 'New file';
+  addBtn.textContent = '+';
+  addBtn.addEventListener('click', promptNewFile);
+  fragment.appendChild(addBtn);
+  nav.replaceChildren(fragment);
+  tabElements.forEach((_, name) => markDirtyState(name));
 }
 
 let foldersInitialized = false;
 const expandedFolders = new Set();
 function renderSidebarFiles() {
+  if (sidebarRenderTimer) {
+    clearTimeout(sidebarRenderTimer);
+    sidebarRenderTimer = null;
+  }
   if (!foldersInitialized && filesList.length > 0) {
-    filesList.forEach(f => {
-      const parts = f.split('/'); let currentPath = '';
-      for (let i = 0; i < parts.length - 1; i++) { currentPath = currentPath ? `${currentPath}/${parts[i]}` : parts[i]; expandedFolders.add(currentPath); }
-    });
+    const activeParts = activeFile.split('/');
+    let currentPath = '';
+    for (let i = 0; i < activeParts.length - 1; i++) {
+      currentPath = currentPath ? currentPath + '/' + activeParts[i] : activeParts[i];
+      expandedFolders.add(currentPath);
+    }
     foldersInitialized = true;
   }
-  const list = document.getElementById('sideFiles'); list.innerHTML = '';
+
+  const list = document.getElementById('sideFiles');
+  const fragment = document.createDocumentFragment();
+  sidebarFileElements.clear();
   const filter = (document.getElementById('fileFilter')?.value || '').trim().toLowerCase();
-  const visibleFiles = filter ? filesList.filter(name => name.toLowerCase().includes(filter)) : filesList;
-  const tree = {};
+  const filtering = Boolean(filter);
+  const visibleFiles = filtering
+    ? filesList.filter(name => name.toLowerCase().includes(filter))
+    : filesList;
+  const tree = Object.create(null);
+
   visibleFiles.forEach(path => {
-    const parts = path.split('/'); let current = tree;
-    parts.forEach((part, i) => { if (!current[part]) current[part] = (i === parts.length - 1) ? 'FILE' : {}; current = current[part]; });
+    const parts = path.split('/');
+    let current = tree;
+    parts.forEach((part, i) => {
+      if (!Object.prototype.hasOwnProperty.call(current, part)) {
+        current[part] = (i === parts.length - 1) ? 'FILE' : Object.create(null);
+      }
+      current = current[part];
+    });
   });
 
   function buildNode(node, path, container) {
     const keys = Object.keys(node).sort((a, b) => {
-      const aIsFile = node[a] === 'FILE'; const bIsFile = node[b] === 'FILE';
-      if (aIsFile && !bIsFile) return 1; if (!aIsFile && bIsFile) return -1; return a.localeCompare(b);
+      const aIsFile = node[a] === 'FILE';
+      const bIsFile = node[b] === 'FILE';
+      if (aIsFile && !bIsFile) return 1;
+      if (!aIsFile && bIsFile) return -1;
+      return a.localeCompare(b);
     });
+
     keys.forEach(key => {
-      const fullPath = path ? `${path}/${key}` : key;
+      const fullPath = path ? path + '/' + key : key;
       if (node[key] === 'FILE') {
         const btn = document.createElement('button');
         btn.className = 'side-item' + (fullPath === activeFile ? ' active' : '');
         btn.dataset.file = fullPath;
         btn.innerHTML = '<svg viewBox="0 0 24 24" width="15" height="15"><path d="M6 3h9l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" stroke="currentColor" stroke-width="1.8" fill="none"/><path d="M14 3v5h5" stroke="currentColor" stroke-width="1.8" fill="none"/></svg><span>' + escapeHtml(key) + '</span>';
         attachFileMenuHandlers(btn, fullPath, () => { switchFile(fullPath); if (isMobile()) closeSidebar(); });
+        sidebarFileElements.set(fullPath, btn);
         container.appendChild(btn);
-      } else {
-        const folderDiv = document.createElement('div');
-        const isExpanded = expandedFolders.has(fullPath);
-        const folderHeader = document.createElement('div');
-        folderHeader.className = 'tree-folder' + (isExpanded ? '' : ' collapsed');
-        folderHeader.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14"><path d="M9 18l6-6-6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg><span>${escapeHtml(key)}</span>`;
-        const childrenContainer = document.createElement('div');
-        childrenContainer.className = 'tree-folder-children' + (isExpanded ? '' : ' hidden');
-        folderHeader.addEventListener('click', () => {
-          const nowCollapsed = !childrenContainer.classList.contains('hidden');
-          childrenContainer.classList.toggle('hidden', nowCollapsed); folderHeader.classList.toggle('collapsed', nowCollapsed);
-          if (nowCollapsed) expandedFolders.delete(fullPath); else expandedFolders.add(fullPath);
-        });
-        folderDiv.appendChild(folderHeader); folderDiv.appendChild(childrenContainer); container.appendChild(folderDiv);
-        buildNode(node[key], fullPath, childrenContainer);
+        markDirtyState(fullPath);
+        return;
       }
+
+      const folderDiv = document.createElement('div');
+      const isExpanded = filtering || expandedFolders.has(fullPath);
+      const folderHeader = document.createElement('div');
+      folderHeader.className = 'tree-folder' + (isExpanded ? '' : ' collapsed');
+      folderHeader.setAttribute('aria-expanded', String(isExpanded));
+      folderHeader.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M9 18l6-6-6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg><span>' + escapeHtml(key) + '</span>';
+      const childrenContainer = document.createElement('div');
+      childrenContainer.className = 'tree-folder-children' + (isExpanded ? '' : ' hidden');
+      const renderChildren = () => {
+        if (childrenContainer.dataset.rendered === 'true') return;
+        buildNode(node[key], fullPath, childrenContainer);
+        childrenContainer.dataset.rendered = 'true';
+      };
+
+      if (isExpanded) renderChildren();
+      folderHeader.addEventListener('click', () => {
+        const expand = childrenContainer.classList.contains('hidden');
+        childrenContainer.classList.toggle('hidden', !expand);
+        folderHeader.classList.toggle('collapsed', !expand);
+        folderHeader.setAttribute('aria-expanded', String(expand));
+        if (expand) {
+          expandedFolders.add(fullPath);
+          renderChildren();
+        } else {
+          expandedFolders.delete(fullPath);
+        }
+      });
+      folderDiv.appendChild(folderHeader);
+      folderDiv.appendChild(childrenContainer);
+      container.appendChild(folderDiv);
     });
   }
-  if (visibleFiles.length) buildNode(tree, '', list);
-  else { const empty = document.createElement('div'); empty.className = 'file-filter-empty'; empty.textContent = 'No matching files'; list.appendChild(empty); }
-  filesList.forEach(markDirtyState);
+
+  if (visibleFiles.length) buildNode(tree, '', fragment);
+  else {
+    const empty = document.createElement('div');
+    empty.className = 'file-filter-empty';
+    empty.textContent = 'No matching files';
+    fragment.appendChild(empty);
+  }
+  list.replaceChildren(fragment);
+  sidebarFileElements.forEach((_, name) => markDirtyState(name));
 }
 
 let tabMenuEl = null, tabMenuFile = null;
@@ -719,7 +965,7 @@ function promptNewFolder() {
   if (!folder) return showToast('Invalid name');
   const placeholder = `${folder}/.gitkeep`;
   if (FILES[placeholder]) return showToast('Folder already exists');
-  FILES[placeholder] = { lang: 'plaintext', content: '' }; filesList.push(placeholder); ensureModel(placeholder);
+  FILES[placeholder] = { lang: 'plaintext', content: '' }; filesList.push(placeholder);
   const parts = folder.split('/'); let currentPath = '';
   parts.forEach(p => { currentPath = currentPath ? `${currentPath}/${p}` : p; expandedFolders.add(currentPath); });
   renderTabs(); renderSidebarFiles(); saveCurrentProjectFiles(); showToast('Created folder ' + folder);
@@ -727,22 +973,31 @@ function promptNewFolder() {
 function renameFile(oldName, newName) {
   newName = (newName || '').trim().replace(/^\/+/, '').replace(/[\\:*?"<>|\x00-\x1F]/g, '');
   if (!newName) return showToast('Invalid name'); if (newName === oldName) return; if (FILES[newName]) return showToast('File already exists');
-  const oldModel = models[oldName], oldContent = oldModel ? oldModel.getValue() : '', newLang = langFromFilename(newName);
-  if (oldModel) oldModel.dispose(); delete models[oldName];
-  FILES[newName] = { lang: newLang, content: oldContent }; delete FILES[oldName];
-  savedSnapshot[newName] = savedSnapshot[oldName] || oldContent; delete savedSnapshot[oldName];
-  filesList = filesList.map(n => n === oldName ? newName : n); if (activeFile === oldName) activeFile = newName;
-  const newModel = monaco.editor.createModel(oldContent, newLang, makeUri(newName));
-  models[newName] = newModel; newModel.onDidChangeContent(() => { markDirtyState(newName); scheduleSave(); });
-  if (window.__hookAutoRun) window.__hookAutoRun(newModel);
-  renderTabs(); renderSidebarFiles(); switchFile(activeFile); saveCurrentProjectFiles(); showToast('Renamed to ' + newName);
+  const oldModel = models[oldName];
+  const oldMeta = FILES[oldName];
+  const oldContent = oldModel ? oldModel.getValue() : (typeof oldMeta === 'string' ? oldMeta : (oldMeta && oldMeta.content) || '');
+  const newLang = langFromFilename(newName);
+  if (oldModel) oldModel.dispose();
+  delete models[oldName];
+  FILES[newName] = { lang: newLang, content: oldContent };
+  delete FILES[oldName];
+  if (Object.prototype.hasOwnProperty.call(savedSnapshot, oldName)) savedSnapshot[newName] = savedSnapshot[oldName];
+  else savedSnapshot[newName] = oldContent;
+  delete savedSnapshot[oldName];
+  filesList = filesList.map(n => n === oldName ? newName : n);
+  if (activeFile === oldName) activeFile = newName;
+  renderTabs(); renderSidebarFiles();
+  if (activeFile === newName) ensureModel(newName);
+  switchFile(activeFile);
+  saveCurrentProjectFiles();
+  showToast('Renamed to ' + newName);
 }
 function deleteFile(name) {
   if (filesList.length <= 1) return showToast('Cannot delete the last file');
   if (!confirm('Delete "' + name + '"?')) return;
   if (models[name]) { models[name].dispose(); delete models[name]; }
   delete FILES[name]; delete savedSnapshot[name]; filesList = filesList.filter(n => n !== name);
-  if (activeFile === name) { activeFile = filesList[0]; editor.setModel(models[activeFile]); }
+  if (activeFile === name) activeFile = filesList[0];
   renderTabs(); renderSidebarFiles(); switchFile(activeFile); saveCurrentProjectFiles(); showToast('Deleted ' + name);
 }
 
@@ -758,8 +1013,13 @@ function wireSidebar() {
   document.getElementById('btnNewFile').addEventListener('click', promptNewFile);
   document.getElementById('btnNewFolder').addEventListener('click', promptNewFolder);
   const fileFilter = document.getElementById('fileFilter');
-  fileFilter.addEventListener('input', renderSidebarFiles);
-  fileFilter.addEventListener('keydown', e => { if (e.key === 'Escape' && fileFilter.value) { fileFilter.value = ''; renderSidebarFiles(); }});
+  fileFilter.addEventListener('input', scheduleSidebarRender);
+  fileFilter.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && fileFilter.value) {
+      fileFilter.value = '';
+      renderSidebarFiles();
+    }
+  });
   
   document.getElementById('btnReset').addEventListener('click', () => { 
     if (!confirm('Reset ALL projects and settings? This cannot be undone.')) return; 
@@ -784,18 +1044,49 @@ function wireSidebar() {
 }
 
 function switchFile(file) {
-  if (file !== 'preview' && !models[file]) return;
+  if (file !== 'preview' && !Object.prototype.hasOwnProperty.call(FILES, file)) return;
+
+  if (file !== 'preview') {
+    let currentPath = '';
+    const parts = file.split('/');
+    let shouldRenderTree = false;
+    for (let i = 0; i < parts.length - 1; i++) {
+      currentPath = currentPath ? currentPath + '/' + parts[i] : parts[i];
+      if (!expandedFolders.has(currentPath)) {
+        expandedFolders.add(currentPath);
+        shouldRenderTree = true;
+      }
+    }
+    if (shouldRenderTree) renderSidebarFiles();
+    ensureModel(file);
+  }
+
+  const previousFile = activeFile;
+  if (previousFile !== file) {
+    const oldTab = findTabEl(previousFile);
+    const oldItem = findSideItemEl(previousFile);
+    if (oldTab) oldTab.classList.remove('active');
+    if (oldItem) oldItem.classList.remove('active');
+  }
   activeFile = file;
-  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.file === file));
-  document.querySelectorAll('.side-item[data-file]').forEach(b => b.classList.toggle('active', b.dataset.file === file));
+  const currentTab = findTabEl(file);
+  const currentItem = findSideItemEl(file);
+  if (currentTab) currentTab.classList.add('active');
+  if (currentItem) currentItem.classList.add('active');
+
   const panes = document.getElementById('panes'), outputPane = document.getElementById('outputPane');
   if (file === 'preview') {
     panes.classList.add('preview-tab-mode'); outputPane.classList.add('show');
-    document.getElementById('editor').style.display = 'none'; document.getElementById('statusFile').textContent = 'Preview'; run();
+    document.getElementById('editor').style.display = 'none';
+    document.getElementById('statusFile').textContent = 'Preview';
+    run();
   } else {
-    panes.classList.remove('preview-tab-mode'); document.getElementById('editor').style.display = 'block';
-    editor.setModel(models[file]); document.getElementById('statusFile').textContent = basename(file);
-    clearDecorations(); if (findbar.classList.contains('show')) refreshMatches();
+    panes.classList.remove('preview-tab-mode');
+    document.getElementById('editor').style.display = 'block';
+    editor.setModel(models[file]);
+    document.getElementById('statusFile').textContent = basename(file);
+    clearDecorations();
+    if (findbar.classList.contains('show')) refreshMatches();
   }
 }
 
@@ -824,7 +1115,7 @@ function wireClipboard() {
   document.getElementById('btnSelectAll').addEventListener('click', () => { editor.setSelection(editor.getModel().getFullModelRange()); });
   document.getElementById('btnShare').addEventListener('click', async () => {
     if (typeof LZString === 'undefined') return showToast('Share unavailable');
-    const data = {}; Object.keys(models).forEach(k => { data[k] = models[k].getValue(); });
+    const data = collectWorkspaceFiles();
     const compressed = LZString.compressToEncodedURIComponent(JSON.stringify(data));
     const ok = await writeClipboardAsync(location.origin + location.pathname + '#s=' + compressed); showToast(ok ? 'Share link copied' : 'Copy failed', 1600);
   });
@@ -885,7 +1176,8 @@ async function formatCurrent() {
 async function downloadZip() {
   try {
     if (!window.JSZip) await loadScript('https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js');
-    const zip = new window.JSZip(); Object.keys(models).forEach(k => zip.file(k, models[k].getValue()));
+    const zip = new window.JSZip();
+    Object.entries(collectWorkspaceFiles()).forEach(([path, content]) => zip.file(path, content));
     const blob = await zip.generateAsync({ type: 'blob' }), url = URL.createObjectURL(blob), a = document.createElement('a');
     a.href = url; a.download = `${projectsData[currentProjectId].name.replace(/\s+/g, '-')}.zip`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 60000); showToast('Downloaded');
@@ -1026,12 +1318,12 @@ async function executeCommand(raw) {
   addTermLine(`$ ${raw}`);
   const args = parseTerminalArgs(raw), cmd = args[0].toLowerCase();
   switch (cmd) {
-    case 'help': addTermLine('Available: clear, ls, cat, touch, mkdir, run, format, git clone, git commit, git push, firebase save/load, theme', 'info'); break;
+    case 'help': addTermLine('Available: clear, ls, cat, touch, mkdir, run, format, git clone, git commit, git pull, git push, firebase save/load, theme', 'info'); break;
     case 'clear': termOutput.innerHTML = ''; break;
     case 'ls': addTermLine(filesList.join('    ')); break;
-    case 'cat': if (!args[1] || !models[args[1]]) return addTermLine('File not found', 'error'); addTermLine(models[args[1]].getValue()); break;
-    case 'touch': if (!args[1]) return addTermLine('Usage: touch <file>', 'error'); if (FILES[args[1]]) return addTermLine('Exists', 'error'); FILES[args[1]] = { lang: langFromFilename(args[1]), content: '' }; filesList.push(args[1]); ensureModel(args[1]); renderTabs(); renderSidebarFiles(); saveCurrentProjectFiles(); addTermLine(`Created ${args[1]}`, 'success'); break;
-    case 'mkdir': if (!args[1]) return addTermLine('Usage: mkdir <folder>', 'error'); const placeholder = `${args[1]}/.gitkeep`; if (FILES[placeholder]) return addTermLine('Exists', 'error'); FILES[placeholder] = { lang: 'plaintext', content: '' }; filesList.push(placeholder); ensureModel(placeholder); renderTabs(); renderSidebarFiles(); saveCurrentProjectFiles(); addTermLine(`Created folder`, 'success'); break;
+    case 'cat': if (!args[1] || !Object.prototype.hasOwnProperty.call(FILES, args[1])) return addTermLine('File not found', 'error'); addTermLine(readProjectFile(args[1])); break;
+    case 'touch': if (!args[1]) return addTermLine('Usage: touch <file>', 'error'); if (FILES[args[1]]) return addTermLine('Exists', 'error'); FILES[args[1]] = { lang: langFromFilename(args[1]), content: '' }; filesList.push(args[1]); renderTabs(); renderSidebarFiles(); saveCurrentProjectFiles(); addTermLine(`Created ${args[1]}`, 'success'); break;
+    case 'mkdir': if (!args[1]) return addTermLine('Usage: mkdir <folder>', 'error'); const placeholder = `${args[1]}/.gitkeep`; if (FILES[placeholder]) return addTermLine('Exists', 'error'); FILES[placeholder] = { lang: 'plaintext', content: '' }; filesList.push(placeholder); renderTabs(); renderSidebarFiles(); saveCurrentProjectFiles(); addTermLine(`Created folder`, 'success'); break;
     case 'run': run(); addTermLine('Preview triggered', 'success'); break;
     case 'format': await formatCurrent(); break;
     case 'theme': if (args[1]) { applyTheme(args[1]); addTermLine(`Theme set to ${args[1]}`, 'success'); } else addTermLine('Usage: theme <vs-dark|vs|dracula|monokai>', 'error'); break;
@@ -1055,24 +1347,38 @@ function addConsoleLine(type, msg) {
   if (type === 'error' && bottomPanel.classList.contains('hidden')) { bottomPanel.classList.remove('hidden'); setActivePanel('console'); if (editor) editor.layout(); }
   consoleEl.scrollTop = consoleEl.scrollHeight;
 }
-window.addEventListener('message', e => { const d = e.data; if (!d || d.__preview !== true) return; addConsoleLine(d.type, d.msg); });
+const PREVIEW_MESSAGE_TYPES = new Set(['log', 'info', 'warn', 'error']);
+window.addEventListener('message', (event) => {
+  const frame = document.getElementById('preview');
+  const data = event.data;
+  if (!frame || event.source !== frame.contentWindow) return;
+  if (!data || typeof data !== 'object' || Array.isArray(data) || data.__preview !== true) return;
+  if (!PREVIEW_MESSAGE_TYPES.has(data.type) || typeof data.msg !== 'string') return;
+  addConsoleLine(data.type, data.msg.slice(0, 5000));
+});
 
-function buildDoc(html, css, js) {
-  const openScript = '<scr' + 'ipt>', closeScript = '</scr' + 'ipt>';
-  const consoleHook = `${openScript}(function(){function ser(v){if(typeof v==='string')return v;if(v instanceof Error)return v.message;try{return JSON.stringify(v);}catch(e){return String(v);}}function send(type,args){try{parent.postMessage({__preview:true,type:type,msg:Array.prototype.map.call(args,ser).join(' ')},'*');}catch(e){}}['log','info','warn','error'].forEach(function(t){var orig=console[t]?console[t].bind(console):function(){};console[t]=function(){orig.apply(null,arguments);send(t,arguments);};});window.addEventListener('error',function(e){send('error',[e.message+' @ line '+e.lineno]);});window.addEventListener('unhandledrejection',function(e){send('error',['Unhandled rejection: '+ser(e.reason)]);});})();${closeScript}`;
-  const headInject = consoleHook + '<style>\n' + (css || '') + '\n</style>';
-  const bodyInject = openScript + '\ntry{\n' + (js || '') + '\n}catch(e){ console.error(e && e.message ? e.message : e); }\n' + closeScript;
-  const h = html || '';
-  if (/<html[\s>]/i.test(h)) {
-    let out = h;
-    if (/<\/head>/i.test(out)) out = out.replace(/<\/head>/i, headInject + '</head>'); else out = out.replace(/<html[^>]*>/i, m => m + '<head>' + headInject + '</head>');
-    if (/<\/body>/i.test(out)) out = out.replace(/<\/body>/i, bodyInject + '</body>'); else out += bodyInject;
-    return out;
-  }
-  return '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' + headInject + '</head><body>' + h + bodyInject + '</body></html>';
+function readProjectFile(path) {
+  const model = models[path];
+  if (model) return model.getValue();
+  const meta = FILES[path];
+  return typeof meta === 'string' ? meta : (meta && meta.content != null ? String(meta.content) : '');
 }
 
-function run() { if (!editor) return; clearConsole(); document.getElementById('outputPane').classList.add('show'); document.getElementById('preview').srcdoc = buildDoc(models['index.html'] ? models['index.html'].getValue() : '', models['style.css'] ? models['style.css'].getValue() : '', models['script.js'] ? models['script.js'].getValue() : ''); }
+function buildDoc(html, css, js, workspaceFiles) {
+  return window.IDEditorCore.buildPreviewDocument(html, css, js, workspaceFiles || collectWorkspaceFiles());
+}
+
+function run() {
+  if (!editor) return;
+  clearConsole();
+  document.getElementById('outputPane').classList.add('show');
+  document.getElementById('preview').srcdoc = buildDoc(
+    readProjectFile('index.html'),
+    readProjectFile('style.css'),
+    readProjectFile('script.js'),
+    collectWorkspaceFiles()
+  );
+}
 
 function wirePreviewControls() {
   const outputPane = document.getElementById('outputPane'), btnFullscreen = document.getElementById('btnFullscreen'), btnOpen = document.getElementById('btnOpen'), btnAuto = document.getElementById('btnAuto'), btnClose = document.getElementById('btnClosePreview');
@@ -1080,7 +1386,25 @@ function wirePreviewControls() {
   function setFullscreen(on) { outputPane.classList.toggle('fullscreen', on); if (on) outputPane.classList.add('show'); btnFullscreen.classList.toggle('on', on); btnFullscreen.title = on ? 'Exit fullscreen' : 'Fullscreen preview'; }
   btnFullscreen.addEventListener('click', () => setFullscreen(!outputPane.classList.contains('fullscreen')));
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && outputPane.classList.contains('fullscreen')) setFullscreen(false); });
-  btnOpen.addEventListener('click', () => { const blob = new Blob([buildDoc(models['index.html'] ? models['index.html'].getValue() : '', models['style.css'] ? models['style.css'].getValue() : '', models['script.js'] ? models['script.js'].getValue() : '')], { type: 'text/html' }); const url = URL.createObjectURL(blob); const w = window.open(url, '_blank'); setTimeout(() => URL.revokeObjectURL(url), 60000); if (!w) alert('Popup blocked'); });
+  btnOpen.addEventListener('click', () => {
+    const html = buildDoc(
+      readProjectFile('index.html'),
+      readProjectFile('style.css'),
+      readProjectFile('script.js'),
+      collectWorkspaceFiles()
+    );
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'ideditor-preview.html';
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    showToast('Preview HTML downloaded');
+  });
   let autoOn = false, autoTimer = null;
   btnAuto.addEventListener('click', () => { autoOn = !autoOn; btnAuto.classList.toggle('on', autoOn); if (autoOn) run(); });
   const hookAuto = (m) => m.onDidChangeContent(() => { if (!autoOn) return; clearTimeout(autoTimer); autoTimer = setTimeout(run, 600); });
@@ -1091,14 +1415,35 @@ function wirePreviewControls() {
    GITHUB REST API IMPLEMENTATION
    ========================================================= */
 
-function getRepoConfig() {
-  return { url: localStorage.getItem(GIT_URL_KEY) || '', token: localStorage.getItem(GIT_TOKEN_KEY) || '' };
+function getRepoConfig(project = currentProject()) {
+  const tracking = project && projectGitTracking(project);
+  return { url: (tracking && tracking.remoteUrl) || localStorage.getItem(GIT_URL_KEY) || '', token: volatileGitToken };
+}
+function setCurrentProjectRemoteUrl(url) {
+  const project = currentProject();
+  if (!project) return;
+  const tracking = projectGitTracking(project);
+  if (project.pendingCommit && project.pendingCommit.remoteUrl !== url) {
+    throw new Error('Push or clear the staged commit before changing this project repository.');
+  }
+  if (tracking.remoteUrl !== url) {
+    tracking.remoteUrl = url;
+    tracking.branch = '';
+    tracking.branches = {};
+  }
+  saveProjectsToStorage();
 }
 
 function parseGitHubUrl(url) {
-  const match = url.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
-  if (!match) return null;
-  return { owner: match[1], repo: match[2] };
+  try {
+    const parsed = new URL(String(url || '').trim());
+    if (parsed.protocol !== 'https:' || !['github.com', 'www.github.com'].includes(parsed.hostname.toLowerCase())) return null;
+    const parts = parsed.pathname.replace(/\/+$/, '').replace(/\.git$/i, '').split('/').filter(Boolean);
+    if (parts.length !== 2 || !parts.every(part => /^[a-zA-Z0-9_.-]+$/.test(part))) return null;
+    return { owner: parts[0], repo: parts[1] };
+  } catch (error) {
+    return null;
+  }
 }
 
 function encodeBase64(str) { return btoa(unescape(encodeURIComponent(str))); }
@@ -1109,7 +1454,8 @@ async function handleGitCommand(args) {
   if (sub === 'clone') {
     if (!args[2]) return addTermLine('Usage: git clone <url>', 'error');
     const repoUrl = args.slice(2).join(' ').trim();
-    localStorage.setItem(GIT_URL_KEY, repoUrl);
+    try { setCurrentProjectRemoteUrl(repoUrl); } catch (error) { addTermLine(error.message, 'error'); return; }
+    localStorage.setItem(GIT_URL_KEY, repoUrl); // Legacy default for newly created projects.
     document.getElementById('gitRepoUrl').value = repoUrl;
     addTermLine(`Cloning: ${repoUrl}...`, 'info');
     const loader = document.createElement('div'); loader.className = 'term-line term-info'; loader.textContent = '⏳ Downloading repository...'; termOutput.appendChild(loader); termOutput.scrollTop = termOutput.scrollHeight;
@@ -1119,154 +1465,286 @@ async function handleGitCommand(args) {
     if (msgIndex === -1 || !args[msgIndex + 1]) return addTermLine('Usage: git commit -m "message"', 'error');
     document.getElementById('gitMessage').value = args.slice(msgIndex + 1).join(' ');
     addTermLine(`Committing...`, 'info'); await gitCommit();
+  } else if (sub === 'pull') {
+    addTermLine('Synchronizing from remote...', 'info');
+    try { await gitPull(); } catch (error) { addTermLine('Pull failed: ' + (error.message || error), 'error'); }
   } else if (sub === 'push') {
-    addTermLine('Pushing...', 'info'); await gitPush();
+    addTermLine('Publishing staged commit...', 'info'); await gitPush();
   } else {
     addTermLine('Unknown git command', 'error');
   }
 }
 
-async function gitClone() {
-  const { url, token } = getRepoConfig();
-  const parsed = parseGitHubUrl(url);
-  if (!parsed) throw new Error('Invalid GitHub URL');
-
-  const headers = { 'Accept': 'application/vnd.github.v3+json' };
-  if (token) headers['Authorization'] = `token ${token}`;
-
-  const repoRes = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}`, { headers });
-  if (!repoRes.ok) throw new Error(`GitHub API: ${repoRes.status} ${repoRes.statusText}`);
-  const repoData = await repoRes.json();
-  
-  const selectedBranch = document.getElementById('gitBranchSelect').value;
-  const branch = selectedBranch || repoData.default_branch || 'main';
-  localStorage.setItem(GIT_BRANCH_KEY, branch);
-
-  const treeRes = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/trees/${branch}?recursive=1`, { headers });
-  if (!treeRes.ok) throw new Error(`GitHub API: ${treeRes.status} ${treeRes.statusText}`);
-  const treeData = await treeRes.json();
-  const blobs = treeData.tree.filter(item => item.type === 'blob');
-
-  const newFiles = {};
-  await Promise.all(blobs.map(async (blob) => {
-    if (blob.size > 5000000) return; // Skip >5MB
-    const contentRes = await fetch(blob.url, { headers });
-    if (contentRes.ok) {
-      const contentData = await contentRes.json();
-      const base64 = contentData.content.replace(/\n/g, '');
-      newFiles[blob.path] = decodeBase64(base64);
-    }
-  }));
-
-  if (editor) editor.setModel(null);
-  filesList.length = 0;
-  Object.keys(FILES).forEach(k => delete FILES[k]);
-  Object.keys(models).forEach(k => { try { models[k].dispose(); } catch (e) {} delete models[k]; });
-  Object.keys(savedSnapshot).forEach(k => delete savedSnapshot[k]);
-  expandedFolders.clear(); foldersInitialized = false;
-
-  Object.keys(newFiles).forEach(name => {
-    FILES[name] = { lang: langFromFilename(name), content: newFiles[name] };
-    filesList.push(name); ensureModel(name);
+function collectWorkspaceFiles() {
+  const snapshot = {};
+  Object.entries(FILES || {}).forEach(([path, meta]) => {
+    snapshot[path] = typeof meta === 'string' ? meta : (meta && meta.content != null ? String(meta.content) : '');
   });
-
-  if (!filesList.length) filesList = ['index.html'];
-  activeFile = filesList[0];
-  renderTabs(); renderSidebarFiles(); switchFile(activeFile); saveCurrentProjectFiles();
-  
-  showToast('Cloned successfully!');
-  updateGitStatus();
+  Object.entries(models).forEach(([path, model]) => { snapshot[path] = model.getValue(); });
+  return snapshot;
 }
-
-async function gitCommit() { await gitPush(); }
-
-async function gitPush() {
-  const { url, token } = getRepoConfig();
-  const parsed = parseGitHubUrl(url);
-  if (!parsed || !token) return showToast('Set repo URL and token in Git Settings');
-  
-  const branch = localStorage.getItem(GIT_BRANCH_KEY) || 'main';
-  const headers = { 'Accept': 'application/vnd.github.v3+json', 'Authorization': `token ${token}`, 'Content-Type': 'application/json' };
-
-  try {
-    let refRes = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/ref/heads/${branch}`, { headers });
-    if (!refRes.ok) throw new Error('Failed to fetch latest commit ref');
-    const refData = await refRes.json();
-    const latestCommitSha = refData.object.sha;
-
-    const commitRes = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/commits/${latestCommitSha}`, { headers });
-    const commitData = await commitRes.json();
-    const baseTreeSha = commitData.tree.sha;
-
-    const treeItems = [];
-    for (const [path, model] of Object.entries(models)) {
-      const content = model.getValue();
-      const blobRes = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/blobs`, {
-        method: 'POST', headers, body: JSON.stringify({ content, encoding: 'utf-8' })
-      });
-      if (!blobRes.ok) throw new Error('Failed to upload blob for ' + path);
-      const blobData = await blobRes.json();
-      treeItems.push({ path, mode: '100644', type: 'blob', sha: blobData.sha });
+function currentProject() { return currentProjectId && projectsData[currentProjectId] ? projectsData[currentProjectId] : null; }
+function projectGitTracking(project = currentProject()) {
+  if (!project) return null;
+  if (!project.gitTracking || typeof project.gitTracking !== 'object') project.gitTracking = { remoteUrl:'', branch:'', branches:{} };
+  if (typeof project.gitTracking.remoteUrl !== 'string') project.gitTracking.remoteUrl = '';
+  if (typeof project.gitTracking.branch !== 'string') project.gitTracking.branch = '';
+  if (!project.gitTracking.branches || typeof project.gitTracking.branches !== 'object') project.gitTracking.branches = {};
+  return project.gitTracking;
+}
+async function fetchGitHubSnapshot(branchOverride) {
+  const config = getRepoConfig(), parsed = parseGitHubUrl(config.url);
+  if (!parsed) throw new Error('Enter a valid GitHub repository URL first.');
+  const headers = { Accept:'application/vnd.github+json' };
+  if (config.token) headers.Authorization = 'Bearer ' + config.token;
+  const repoResponse = await fetch('https://api.github.com/repos/' + parsed.owner + '/' + parsed.repo, { headers });
+  const repoData = await repoResponse.json().catch(() => ({}));
+  if (!repoResponse.ok) throw new Error(repoData.message || 'Unable to access repository.');
+  const select = document.getElementById('gitBranchSelect');
+  const tracking = projectGitTracking(currentProject());
+  const branch = branchOverride || (tracking && tracking.remoteUrl === config.url && tracking.branch) || (select && select.value) || repoData.default_branch || 'main';
+  const branchResponse = await fetch('https://api.github.com/repos/' + parsed.owner + '/' + parsed.repo + '/branches/' + encodeURIComponent(branch), { headers });
+  const branchData = await branchResponse.json().catch(() => ({}));
+  if (!branchResponse.ok || !branchData.commit || !branchData.commit.sha) throw new Error(branchData.message || 'Unable to read branch ' + branch);
+  const commitResponse = await fetch('https://api.github.com/repos/' + parsed.owner + '/' + parsed.repo + '/git/commits/' + branchData.commit.sha, { headers });
+  const commitData = await commitResponse.json().catch(() => ({}));
+  if (!commitResponse.ok || !commitData.tree || !commitData.tree.sha) throw new Error(commitData.message || 'Unable to read branch tree.');
+  const treeResponse = await fetch('https://api.github.com/repos/' + parsed.owner + '/' + parsed.repo + '/git/trees/' + commitData.tree.sha + '?recursive=1', { headers });
+  const treeData = await treeResponse.json().catch(() => ({}));
+  if (!treeResponse.ok || treeData.truncated) throw new Error(treeData.message || 'Repository tree is incomplete; no files changed.');
+  const entries = treeData.tree || [];
+  const unsupported = entries.find(item => item.type === 'commit' || (item.type === 'blob' && item.mode !== '100644'));
+  if (unsupported) throw new Error('Unsupported Git entry (' + unsupported.mode + ' ' + unsupported.type + '): ' + unsupported.path + '. Clone stopped without changing the project.');
+  const blobs = entries.filter(item => item.type === 'blob'), files = {};
+  for (const blob of blobs) {
+    if (blob.size > 5000000) throw new Error('File exceeds the 5 MB editor limit: ' + blob.path);
+    const response = await fetch(blob.url, { headers }), data = await response.json().catch(() => ({}));
+    if (!response.ok || data.encoding !== 'base64' || typeof data.content !== 'string') throw new Error('Unable to download ' + blob.path);
+    files[blob.path] = window.IDEditorCore.decodeBase64Text(data.content.replace(/\n/g, ''), blob.path);
+  }
+  return { owner:parsed.owner, repo:parsed.repo, remoteUrl:config.url, branch, headSha:branchData.commit.sha, files };
+}
+function applyWorkspaceFiles(fileSnapshot) {
+  const previousFile = activeFile;
+  if (editor) editor.setModel(null);
+  Object.keys(models).forEach(path => { try { models[path].dispose(); } catch (error) {} delete models[path]; });
+  Object.keys(savedSnapshot).forEach(path => delete savedSnapshot[path]);
+  Object.keys(FILES).forEach(path => delete FILES[path]);
+  filesList.length = 0; expandedFolders.clear(); foldersInitialized = false;
+  Object.entries(fileSnapshot || {}).forEach(([path, content]) => {
+    FILES[path] = { lang:langFromFilename(path), content:String(content) };
+    filesList.push(path);
+  });
+  if (!filesList.length) { FILES['index.html'] = { lang:'html', content:DEFAULT_HTML }; filesList.push('index.html'); }
+  activeFile = filesList.includes(previousFile) ? previousFile : filesList[0];
+  // Load only the file that will be visible. Other workspace files stay in
+  // FILES and are materialized as Monaco models when the user opens them.
+  ensureModel(activeFile);
+  renderTabs(); renderSidebarFiles(); switchFile(activeFile); saveCurrentProjectFiles();
+}
+async function gitClone(options = {}) {
+  const targetProjectId = currentProjectId;
+  const config = getRepoConfig();
+  if (!parseGitHubUrl(config.url)) throw new Error('Invalid GitHub URL');
+  await updateGitStatus();
+  const snapshot = await fetchGitHubSnapshot(options.branch || null);
+  if (currentProjectId !== targetProjectId || !projectsData[targetProjectId]) {
+    showToast('Clone cancelled because the active project changed. Retry from the intended project.');
+    return false;
+  }
+  const localFiles = collectWorkspaceFiles(), defaults = {};
+  Object.entries(DEFAULT_FILES).forEach(([path, value]) => { defaults[path] = value.content || ''; });
+  const clean = window.IDEditorCore.sameFileSnapshots(localFiles, defaults) || Object.values(localFiles).every(value => !value);
+  if (!options.replace && !clean && !confirm('Cloning will replace the current project files. Continue?')) return false;
+  applyWorkspaceFiles(snapshot.files);
+  const project = currentProject(), tracking = projectGitTracking(project);
+  tracking.remoteUrl = snapshot.remoteUrl; tracking.branch = snapshot.branch;
+  tracking.branches[snapshot.branch] = { headSha:snapshot.headSha, files:{ ...snapshot.files } };
+  delete project.pendingCommit;
+  const persisted = await saveProjectsToStorage([targetProjectId]);
+  if (!persisted) {
+    showToast('Clone loaded, but local saving failed. Export the project before closing.');
+    addTermLine('Clone loaded in memory; IndexedDB did not confirm the save.', 'error');
+    return false;
+  }
+  showToast('Cloned ' + snapshot.owner + '/' + snapshot.repo + ' (' + snapshot.branch + ')');
+  addTermLine('Clone complete: ' + Object.keys(snapshot.files).length + ' files', 'success');
+  await updateGitStatus();
+  return true;
+}
+async function gitPull(branchOverride) {
+  const targetProjectId = currentProjectId;
+  const project = currentProject(), tracking = projectGitTracking(project), config = getRepoConfig();
+  if (!project || !tracking || tracking.remoteUrl !== config.url || !tracking.branches[tracking.branch]) {
+    showToast('Clone this repository into the project before using Pull.'); return false;
+  }
+  if (project.pendingCommit) { showToast('Push or clear the staged commit before pulling.'); return false; }
+  const targetBranch = branchOverride || tracking.branch || (document.getElementById('gitBranchSelect') && document.getElementById('gitBranchSelect').value) || 'main';
+  const snapshot = await fetchGitHubSnapshot(targetBranch);
+  if (currentProjectId !== targetProjectId || currentProject() !== project) {
+    showToast('Pull cancelled because the active project changed. Retry from the intended project.');
+    return false;
+  }
+  const localFiles = collectWorkspaceFiles();
+  const targetBase = tracking.branches[targetBranch];
+  let mergedFiles;
+  if (targetBase && targetBase.files) {
+    const merged = window.IDEditorCore.mergeFileSnapshots(targetBase.files, localFiles, snapshot.files);
+    if (merged.conflicts.length) {
+      showToast('Pull stopped: conflicting files ' + merged.conflicts.slice(0,5).join(', '));
+      addTermLine('Pull conflict. No files changed: ' + merged.conflicts.join(', '), 'error'); return false;
     }
-
-    const newTreeRes = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/trees`, {
-      method: 'POST', headers, body: JSON.stringify({ base_tree: baseTreeSha, tree: treeItems })
+    mergedFiles = merged.files;
+  } else {
+    const previousBase = tracking.branches[tracking.branch];
+    if (!previousBase || !window.IDEditorCore.sameFileSnapshots(localFiles, previousBase.files)) {
+      showToast('This branch has no sync baseline and local edits exist. Clone it into a new project first.'); return false;
+    }
+    mergedFiles = snapshot.files;
+  }
+  applyWorkspaceFiles(mergedFiles);
+  tracking.remoteUrl = snapshot.remoteUrl; tracking.branch = snapshot.branch;
+  tracking.branches[snapshot.branch] = { headSha:snapshot.headSha, files:{ ...snapshot.files } };
+  const persisted = await saveProjectsToStorage([targetProjectId]);
+  if (!persisted) {
+    showToast('Pull applied in memory, but local saving failed. Export the project before closing.');
+    addTermLine('Pull applied; IndexedDB did not confirm the save.', 'error');
+    return false;
+  }
+  showToast('Pulled and synchronized ' + snapshot.branch);
+  addTermLine('Pull complete. Non-overlapping local changes were preserved.', 'success');
+  await updateGitStatus(); return true;
+}
+async function gitCommit() {
+  const targetProjectId = currentProjectId;
+  const project = currentProject();
+  if (!project) return showToast('No active project');
+  if (project.pendingCommit) return showToast('Push the staged commit before creating another one.');
+  const savedLocally = await saveCurrentProjectFiles();
+  if (!savedLocally) {
+    showToast('Cannot stage a commit because the local project save failed.');
+    return false;
+  }
+  if (currentProjectId !== targetProjectId || currentProject() !== project) {
+    showToast('Commit cancelled because the active project changed.');
+    return false;
+  }
+  const tracking = projectGitTracking(project);
+  const branch = tracking.branch || (document.getElementById('gitBranchSelect') && document.getElementById('gitBranchSelect').value) || 'main';
+  const message = (document.getElementById('gitMessage').value || 'Update from IDEDITOR').trim();
+  project.pendingCommit = { id:generateId(), message, branch, remoteUrl:getRepoConfig().url, files:collectWorkspaceFiles(), createdAt:Date.now() };
+  const persisted = await saveProjectsToStorage([targetProjectId]);
+  if (!persisted) {
+    showToast('Commit staged in memory, but could not be saved locally. Export before closing.');
+    addTermLine('Commit staged in memory only; IndexedDB did not confirm the save.', 'error');
+    return false;
+  }
+  showToast('Commit saved locally. Push to publish it.');
+  addTermLine('Staged local commit: ' + message, 'success'); return true;
+}
+async function gitPush() {
+  const targetProjectId = currentProjectId;
+  const project = currentProject(), pending = project && project.pendingCommit;
+  const config = getRepoConfig(), parsed = parseGitHubUrl(config.url);
+  if (!project || !pending) return showToast('Commit Changes first, then Push.');
+  if (!parsed || !config.token) return showToast('Set a valid repository URL and session token in Git Settings.');
+  if (pending.remoteUrl !== config.url) return showToast('The staged commit belongs to a different repository.');
+  const branch = pending.branch;
+  const tracking = projectGitTracking(project);
+  if (tracking.branch && branch !== tracking.branch) return showToast('The staged commit belongs to a different project branch.');
+  const baseline = tracking && tracking.remoteUrl === config.url && tracking.branches[branch];
+  if (!baseline || !baseline.headSha) return showToast('Clone or Pull this branch before pushing.');
+  const headers = { Accept:'application/vnd.github+json', Authorization:'Bearer ' + config.token, 'Content-Type':'application/json' };
+  try {
+    const branchResponse = await fetch('https://api.github.com/repos/' + parsed.owner + '/' + parsed.repo + '/branches/' + encodeURIComponent(branch), { headers });
+    const branchData = await branchResponse.json().catch(() => ({})), remoteHead = branchData.commit && branchData.commit.sha;
+    if (!branchResponse.ok) throw new Error(branchData.message || 'Unable to read remote branch.');
+    if (!window.IDEditorCore.canPublishAgainst(remoteHead, baseline.headSha)) throw new Error('Remote branch moved. Pull and resolve changes before pushing.');
+    const commitResponse = await fetch('https://api.github.com/repos/' + parsed.owner + '/' + parsed.repo + '/git/commits/' + remoteHead, { headers });
+    const commitData = await commitResponse.json().catch(() => ({}));
+    if (!commitResponse.ok || !commitData.tree || !commitData.tree.sha) throw new Error(commitData.message || 'Unable to read remote commit tree.');
+    const blobShas = {};
+    for (const path of Object.keys(pending.files)) {
+      if (Object.prototype.hasOwnProperty.call(baseline.files, path) && pending.files[path] === baseline.files[path]) continue;
+      const blobResponse = await fetch('https://api.github.com/repos/' + parsed.owner + '/' + parsed.repo + '/git/blobs', {
+        method:'POST', headers, body:JSON.stringify({ content:pending.files[path], encoding:'utf-8' })
+      });
+      const blobData = await blobResponse.json().catch(() => ({}));
+      if (!blobResponse.ok || !blobData.sha) throw new Error(blobData.message || 'Failed to upload ' + path);
+      blobShas[path] = blobData.sha;
+    }
+    const treeItems = window.IDEditorCore.buildGitTreeEntries(pending.files, baseline.files, blobShas);
+    if (!treeItems.length) {
+      delete project.pendingCommit;
+      const persisted = await saveProjectsToStorage([targetProjectId]);
+      if (!persisted) {
+        project.pendingCommit = pending;
+        showToast('No remote changes were needed, but the local staged commit could not be cleared.');
+        return false;
+      }
+      document.getElementById('gitMessage').value = '';
+      showToast('No changes to push.'); return true;
+    }
+    const treeResponse = await fetch('https://api.github.com/repos/' + parsed.owner + '/' + parsed.repo + '/git/trees', {
+      method:'POST', headers, body:JSON.stringify({ base_tree:commitData.tree.sha, tree:treeItems })
     });
-    const newTreeData = await newTreeRes.json();
-
-    const msg = (document.getElementById('gitMessage').value || 'Update from IDEDITOR').trim();
-    const newCommitRes = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/commits`, {
-      method: 'POST', headers, body: JSON.stringify({ message: msg, tree: newTreeData.sha, parents: [latestCommitSha] })
+    const treeData = await treeResponse.json().catch(() => ({}));
+    if (!treeResponse.ok || !treeData.sha) throw new Error(treeData.message || 'Failed to create Git tree.');
+    const newCommitResponse = await fetch('https://api.github.com/repos/' + parsed.owner + '/' + parsed.repo + '/git/commits', {
+      method:'POST', headers, body:JSON.stringify({ message:pending.message, tree:treeData.sha, parents:[remoteHead] })
     });
-    const newCommitData = await newCommitRes.json();
-
-    const updateRefRes = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/refs/heads/${branch}`, {
-      method: 'PATCH', headers, body: JSON.stringify({ sha: newCommitData.sha, force: true })
+    const newCommitData = await newCommitResponse.json().catch(() => ({}));
+    if (!newCommitResponse.ok || !newCommitData.sha) throw new Error(newCommitData.message || 'Failed to create remote commit.');
+    const updateRefResponse = await fetch('https://api.github.com/repos/' + parsed.owner + '/' + parsed.repo + '/git/refs/heads/' + encodeURIComponent(branch), {
+      method:'PATCH', headers, body:JSON.stringify({ sha:newCommitData.sha, force:false })
     });
-    if (!updateRefRes.ok) throw new Error('Failed to update branch');
-
+    const updateRefData = await updateRefResponse.json().catch(() => ({}));
+    if (!updateRefResponse.ok) throw new Error(updateRefData.message || 'Push rejected because remote branch moved.');
+    baseline.headSha = newCommitData.sha; baseline.files = { ...pending.files };
+    delete project.pendingCommit;
+    const persisted = currentProjectId === targetProjectId
+      ? await saveCurrentProjectFiles()
+      : await saveProjectsToStorage([targetProjectId]);
+    if (!persisted) {
+      showToast('GitHub accepted the push, but local sync data could not be saved. Pull before attempting another push.');
+      addTermLine('Remote push succeeded; local IndexedDB persistence failed.', 'error');
+      await updateGitStatus();
+      return false;
+    }
     document.getElementById('gitMessage').value = '';
-    showToast('Pushed successfully!');
-    addTermLine('Push successful', 'success');
-    updateGitStatus();
-
-  } catch (e) {
-    showToast('Push failed: ' + e.message);
-    addTermLine('Push failed: ' + e.message, 'error');
+    showToast('Pushed committed snapshot to ' + branch);
+    addTermLine('Push successful: ' + newCommitData.sha.slice(0,7), 'success');
+    await updateGitStatus(); return true;
+  } catch (error) {
+    showToast('Push failed: ' + (error.message || 'Unknown GitHub error'));
+    addTermLine('Push failed: ' + (error.message || error), 'error'); return false;
   }
 }
-
 async function updateGitStatus() {
-  const el = document.getElementById('gitStatus');
-  const branchSelect = document.getElementById('gitBranchSelect');
-  const { url, token } = getRepoConfig();
-  const parsed = parseGitHubUrl(url);
-  
+  const el = document.getElementById('gitStatus'), branchSelect = document.getElementById('gitBranchSelect');
+  const config = getRepoConfig(), parsed = parseGitHubUrl(config.url);
   if (!parsed) { el.textContent = 'Not connected'; branchSelect.style.display = 'none'; return; }
-  
-  const headers = { 'Accept': 'application/vnd.github.v3+json' };
-  if (token) headers['Authorization'] = `token ${token}`;
-  
+  const headers = { Accept:'application/vnd.github+json' };
+  if (config.token) headers.Authorization = 'Bearer ' + config.token;
   try {
-    const res = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}`, { headers });
-    if (res.ok) {
-      el.textContent = `Connected: ${parsed.owner}/${parsed.repo}`;
-      const branchRes = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/branches`, { headers });
-      if (branchRes.ok) {
-        const branches = await branchRes.json();
-        const currentBranch = localStorage.getItem(GIT_BRANCH_KEY) || 'main';
-        branchSelect.innerHTML = '';
-        branches.forEach(b => {
-          const opt = document.createElement('option');
-          opt.value = b.name;
-          opt.textContent = b.name;
-          if (b.name === currentBranch) opt.selected = true;
-          branchSelect.appendChild(opt);
-        });
-        branchSelect.style.display = 'block';
-      }
-    } else { el.textContent = 'Not connected (Invalid URL/Token)'; branchSelect.style.display = 'none'; }
-  } catch (e) { el.textContent = 'Not connected'; branchSelect.style.display = 'none'; }
+    const repoResponse = await fetch('https://api.github.com/repos/' + parsed.owner + '/' + parsed.repo, { headers });
+    const repoData = await repoResponse.json().catch(() => ({}));
+    if (!repoResponse.ok) throw new Error(repoData.message || 'Repository unavailable');
+    el.textContent = 'Connected: ' + parsed.owner + '/' + parsed.repo;
+    const branchResponse = await fetch('https://api.github.com/repos/' + parsed.owner + '/' + parsed.repo + '/branches?per_page=100', { headers });
+    const branches = await branchResponse.json().catch(() => []);
+    if (!branchResponse.ok || !Array.isArray(branches)) throw new Error('Unable to load branches');
+    const tracking = projectGitTracking(currentProject());
+    const preferred = (tracking && tracking.remoteUrl === config.url && tracking.branch) || repoData.default_branch;
+    branchSelect.innerHTML = '';
+    branches.forEach(info => { const option = document.createElement('option'); option.value = info.name; option.textContent = info.name; branchSelect.appendChild(option); });
+    branchSelect.value = branches.some(info => info.name === preferred) ? preferred : repoData.default_branch;
+    if (!branchSelect.value && branches.length) branchSelect.selectedIndex = 0;
+    branchSelect.style.display = branches.length ? 'block' : 'none';
+    branchSelect.dataset.currentBranch = branchSelect.value || repoData.default_branch;
+  } catch (error) {
+    el.textContent = 'Not connected (' + (error.message || 'API error') + ')'; branchSelect.style.display = 'none';
+  }
 }
 
 function wireGitUI() {
@@ -1280,15 +1758,25 @@ function wireGitUI() {
   document.getElementById('btnGitSaveSettings').addEventListener('click', async () => {
     const url = document.getElementById('gitRepoUrl').value.trim();
     const token = document.getElementById('gitToken').value.trim();
-    localStorage.setItem(GIT_URL_KEY, url);
-    localStorage.setItem(GIT_TOKEN_KEY, token);
-    
+    if (url && !parseGitHubUrl(url)) {
+      showToast('Enter a valid HTTPS GitHub repository URL');
+      return;
+    }
+    try { setCurrentProjectRemoteUrl(url); } catch (error) { showToast(error.message); return; }
+    localStorage.setItem(GIT_URL_KEY, url); // Legacy default for newly created projects.
+    volatileGitToken = token;
+    try { localStorage.removeItem(GIT_TOKEN_KEY); } catch (error) {}
+
     if (firebaseEnabled && fbUser) {
       try {
-        const { doc, setDoc } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js');
-        await setDoc(doc(fbDb, 'users', fbUser.uid, 'settings', 'git'), { url, token, updatedAt: new Date().toISOString() }, { merge: true });
-        addTermLine('Git settings saved to Cloud', 'success');
-      } catch (e) { addTermLine('Failed to save Git settings to cloud', 'error'); }
+        const { doc, setDoc, updateDoc, deleteField } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js');
+        const settingsRef = doc(fbDb, 'users', fbUser.uid, 'settings', 'git');
+        await setDoc(settingsRef, { url, updatedAt: new Date().toISOString() }, { merge: true });
+        try { await updateDoc(settingsRef, { token: deleteField() }); } catch (cleanupError) {
+          console.warn('Legacy Firebase Git token cleanup could not complete.');
+        }
+        addTermLine('Repository URL saved to Cloud; token remains in this tab only', 'success');
+      } catch (e) { addTermLine('Failed to save repository URL to cloud', 'error'); }
     }
     document.getElementById('gitSettingsModal').style.display = 'none';
     showToast('Git settings saved');
@@ -1298,16 +1786,29 @@ function wireGitUI() {
   document.getElementById('btnGitCloseSettings').addEventListener('click', () => document.getElementById('gitSettingsModal').style.display = 'none');
   document.getElementById('btnGitCommit').addEventListener('click', gitCommit); 
   document.getElementById('btnGitPush').addEventListener('click', gitPush);
-  document.getElementById('btnGitPull').addEventListener('click', gitClone); 
+  document.getElementById('btnGitPull').addEventListener('click', () => {
+    gitPull().catch(error => {
+      showToast('Pull failed: ' + (error.message || 'Unknown error'));
+      addTermLine('Pull failed: ' + (error.message || error), 'error');
+    });
+  }); 
   
   document.getElementById('gitBranchSelect').addEventListener('change', (e) => {
-    const branch = e.target.value;
-    if (branch) {
-      localStorage.setItem(GIT_BRANCH_KEY, branch);
-      if (confirm(`Switch to branch "${branch}"? This will reload the files from that branch.`)) {
-        gitClone().catch(err => addTermLine('Switch failed: ' + err.message, 'error'));
-      }
+    const tracking = projectGitTracking(currentProject());
+    const previousBranch = (tracking && tracking.branch) || e.target.dataset.currentBranch || 'main';
+    const selectedBranch = e.target.value;
+    if (!selectedBranch || selectedBranch === previousBranch) return;
+    if (!confirm('Switch to branch "' + selectedBranch + '" and synchronize it with this project?')) {
+      e.target.value = previousBranch;
+      return;
     }
+    gitPull(selectedBranch).then(success => {
+      if (!success) e.target.value = previousBranch;
+    }).catch(error => {
+      e.target.value = previousBranch;
+      showToast('Branch switch failed: ' + (error.message || 'Unknown error'));
+      addTermLine('Branch switch failed: ' + (error.message || error), 'error');
+    });
   });
   
   document.getElementById('btnGitGraph').addEventListener('click', () => { document.getElementById('gitGraphContainer').style.display = 'block'; renderGitGraph(); });
@@ -1324,10 +1825,11 @@ async function renderGitGraph() {
   
   const headers = { 'Accept': 'application/vnd.github.v3+json' };
   if (token) headers['Authorization'] = `token ${token}`;
-  const branch = localStorage.getItem(GIT_BRANCH_KEY) || 'main';
+  const tracking = projectGitTracking(currentProject());
+  const branch = (tracking && tracking.branch) || (document.getElementById('gitBranchSelect') && document.getElementById('gitBranchSelect').value) || 'main';
 
   try {
-    const res = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/commits?sha=${branch}`, { headers });
+    const res = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/commits?sha=${encodeURIComponent(branch)}`, { headers });
     const commits = await res.json();
     if (!commits.length) return;
     

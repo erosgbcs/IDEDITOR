@@ -1307,3 +1307,11 @@ html[data-theme="light"] .ai-applied-indicator {
 html[data-theme="light"] .ai-md-content code { background: rgba(0,0,0,0.06); }
 /* Ensure highlight.js background matches our block */
 .ai-code-block pre { margin: 0; background: transparent !important; padding: 0 !important; }
+
+/* Credential handling notice */
+.ai-credential-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}

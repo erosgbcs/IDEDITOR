@@ -1307,3 +1307,431 @@ html[data-theme="light"] .ai-applied-indicator {
 html[data-theme="light"] .ai-md-content code { background: rgba(0,0,0,0.06); }
 /* Ensure highlight.js background matches our block */
 .ai-code-block pre { margin: 0; background: transparent !important; padding: 0 !important; }
+
+/* =========================================================
+   AI CODE BLOCK (v2) — header + actions + body
+   ========================================================= */
+.ai-code-block {
+  background: #0d0d0d;
+  border: 1px solid #333;
+  border-radius: 8px;
+  margin: 10px 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-self: stretch;
+}
+
+.ai-code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid #333;
+  font-size: 11px;
+  flex-wrap: wrap;
+}
+
+.ai-code-lang {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  color: #888;
+  text-transform: lowercase;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.ai-code-block pre {
+  margin: 0;
+  padding: 12px !important;
+  overflow-x: auto;
+  background: transparent !important;
+  font-size: 12px;
+  line-height: 1.5;
+  border: 0;
+}
+
+.ai-code-actions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  margin: 0;
+  padding: 0;
+  align-self: auto;
+}
+
+/* Icon button — shared across toolbar / code blocks / settings */
+.ai-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 26px;
+  min-width: 26px;
+  padding: 0 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  touch-action: manipulation;
+}
+.ai-icon-btn:hover  { background: rgba(255,255,255,0.08); border-color: var(--accent); }
+.ai-icon-btn:active { background: rgba(255,255,255,0.14); }
+.ai-icon-btn svg    { flex: 0 0 auto; }
+
+.ai-icon-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.ai-icon-btn-primary:hover { background: #0074dd; }
+
+.ai-icon-btn-danger {
+  color: #ff7b72;
+  border-color: rgba(255,123,114,0.5);
+}
+.ai-icon-btn-danger:hover { background: rgba(255,123,114,0.12); border-color: #ff7b72; }
+
+.ai-keep-btn {
+  background: #238636 !important;
+  border-color: #2ea043 !important;
+  color: #fff !important;
+}
+.ai-keep-btn:hover { background: #2ea043 !important; }
+
+.ai-discard-btn {
+  background: transparent !important;
+  border-color: #d64545 !important;
+  color: #ff7b72 !important;
+}
+.ai-discard-btn:hover { background: rgba(214, 69, 69, 0.12) !important; }
+
+.ai-applied-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: #3fb950;
+  padding: 4px 10px;
+  background: rgba(63, 185, 80, 0.12);
+  border-radius: 5px;
+}
+.ai-applied-indicator svg { flex: 0 0 auto; }
+
+/* Streaming placeholder */
+.ai-streaming-body {
+  color: var(--muted, #8b8b8b);
+  font-style: italic;
+  white-space: pre-wrap;
+}
+.ai-streaming .ai-agent-chip::after {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: ai-pulse 1s ease-in-out infinite;
+}
+@keyframes ai-pulse {
+  0%, 100% { opacity: 0.3; }
+  50%      { opacity: 1; }
+}
+
+/* Pipeline divider */
+.ai-pipeline-divider {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  color: var(--muted, #8b8b8b);
+  justify-content: center;
+  font-size: 11px;
+}
+
+/* Light theme */
+html[data-theme="light"] .ai-code-block {
+  background: #f8f8f8;
+  border-color: #ccc;
+}
+html[data-theme="light"] .ai-code-header {
+  background: rgba(0, 0, 0, 0.03);
+  border-bottom-color: #ccc;
+}
+html[data-theme="light"] .ai-code-lang { color: #666; }
+html[data-theme="light"] .ai-icon-btn {
+  color: #1e1e1e;
+  border-color: #ccc;
+}
+html[data-theme="light"] .ai-icon-btn:hover { background: rgba(0,0,0,0.06); }
+html[data-theme="light"] .ai-icon-btn-primary { color: #fff; }
+
+/* Mobile code block */
+@media (max-width: 899px) {
+  .ai-code-block pre { font-size: 11px; padding: 10px !important; }
+  .ai-code-header { padding: 5px 8px; }
+  .ai-code-lang { font-size: 10.5px; }
+  .ai-icon-btn {
+    height: 32px;
+    min-width: 32px;
+    padding: 0 10px;
+    font-size: 11.5px;
+  }
+  .ai-icon-btn svg { width: 13px; height: 13px; }
+  .ai-btn-label { font-size: 11.5px; }
+}
+
+/* =========================================================
+   AI TOOLBAR (v2)
+   ========================================================= */
+.ai-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  flex: 0 0 auto;
+}
+
+.ai-toolbar .ai-mode-select {
+  width: 100px;
+  height: 30px;
+  margin: 0;
+  padding: 0 8px;
+  background-image: none;
+  font-size: 11.5px;
+}
+
+.ai-toolbar .btn {
+  height: 30px;
+  padding: 0 10px;
+  font-size: 11.5px;
+  flex: 0 1 auto;
+}
+
+.ai-agent-picker {
+  position: relative;
+  min-width: 140px;
+  flex: 1 1 auto;
+}
+.ai-agent-picker .btn {
+  width: 100%;
+  justify-content: flex-start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-agent-menu {
+  display: none;
+  position: absolute;
+  z-index: 5;
+  top: 34px;
+  left: 0;
+  min-width: 220px;
+  max-width: calc(100vw - 24px);
+  max-height: 50vh;
+  overflow-y: auto;
+  padding: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+}
+.ai-agent-menu.open { display: grid; gap: 6px; }
+.ai-agent-menu label { font-size: 11px; white-space: normal; padding: 4px 2px; }
+.ai-agent-menu-empty {
+  padding: 8px;
+  font-size: 11px;
+  color: var(--muted, #8b8b8b);
+  text-align: center;
+}
+
+.ai-agent-chip {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+@media (max-width: 899px) {
+  .ai-toolbar { gap: 4px; padding: 5px 6px; }
+  .ai-toolbar .btn { height: 34px; padding: 0 10px; font-size: 12px; }
+  .ai-toolbar .ai-mode-select { height: 34px; width: auto; min-width: 84px; font-size: 12px; }
+  .ai-agent-picker { flex: 1 1 100%; min-width: 0; }
+  .ai-agent-picker .btn { height: 34px; font-size: 12px; }
+  .ai-toolbar .ai-icon-btn { height: 34px; min-width: 34px; padding: 0 10px; }
+  .ai-toolbar .ai-btn-label { display: none; }
+  .ai-toolbar .ai-icon-btn svg { width: 16px; height: 16px; }
+}
+
+/* =========================================================
+   AI SETTINGS MODAL (v2)
+   ========================================================= */
+#aiSettingsModal .modal-content {
+  max-width: 480px;
+  max-height: calc(100vh - 40px);
+  display: flex;
+  flex-direction: column;
+}
+
+#aiSettingsModal .ai-settings-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+#aiSettingsModal .ai-settings-tabs .btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+#aiSettingsModal .ai-settings-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 4px;
+}
+
+#aiSettingsModal .modal-buttons {
+  flex: 0 0 auto;
+  margin-top: 12px;
+}
+
+.ai-agent-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.ai-agent-row > span { flex: 1; color: var(--muted, #8b8b8b); }
+.ai-agent-row-actions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.ai-agent-form {
+  display: grid;
+  gap: 10px;
+  padding-bottom: 4px;
+}
+.ai-agent-form label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted, #8b8b8b);
+  font-size: 11px;
+}
+.ai-agent-form input,
+.ai-agent-form select,
+.ai-agent-form textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  color: var(--fg);
+  background: #1b1b1b;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+  font-family: inherit;
+  min-height: 34px;
+  transition: border-color 0.12s;
+}
+.ai-agent-form input:focus,
+.ai-agent-form select:focus,
+.ai-agent-form textarea:focus { border-color: var(--accent); }
+.ai-agent-form textarea { min-height: 70px; resize: vertical; }
+.ai-agent-form input[type="range"] {
+  padding: 0;
+  min-height: 24px;
+  background: transparent;
+  border: 0;
+}
+.ai-form-buttons {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.ai-form-buttons .btn { flex: 1; }
+
+html[data-theme="light"] .ai-agent-form input,
+html[data-theme="light"] .ai-agent-form select,
+html[data-theme="light"] .ai-agent-form textarea {
+  background: #fff;
+  color: #1e1e1e;
+  border-color: #c8c8c8;
+}
+
+@media (max-width: 899px) {
+  #aiSettingsModal .modal-content {
+    max-width: 100%;
+    max-height: calc(100dvh - 24px);
+    padding: 16px;
+  }
+  .ai-agent-form input,
+  .ai-agent-form select,
+  .ai-agent-form textarea {
+    font-size: 16px;
+    min-height: 44px;
+  }
+  .ai-agent-form textarea { min-height: 88px; }
+  .ai-agent-row { padding: 10px 0; }
+  .ai-agent-row > span { flex: 1 1 100%; order: 3; padding-left: 22px; }
+  .ai-agent-row-actions .ai-btn-label { display: inline; }
+  .ai-form-buttons { flex-wrap: wrap; }
+  .ai-form-buttons .btn { flex: 1 1 auto; min-height: 40px; font-size: 13px; }
+}
+
+/* =========================================================
+   AI MESSAGES
+   ========================================================= */
+.ai-error-card {
+  border-left: 3px solid #e05252;
+  background: rgba(90,32,32,0.2);
+}
+html[data-theme="light"] .ai-error-card {
+  background: rgba(224, 82, 82, 0.08);
+  border-left-color: #c0392b;
+}
+
+.ai-md-content p { margin: 0 0 10px 0; }
+.ai-md-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+.ai-md-content th,
+.ai-md-content td {
+  border: 1px solid var(--border);
+  padding: 6px 8px;
+  text-align: left;
+}
+.ai-md-content th {
+  background: rgba(255,255,255,0.05);
+  font-weight: 600;
+}
+.ai-md-content code {
+  background: rgba(255,255,255,0.1);
+  padding: 2px 4px;
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 12px;
+}
+html[data-theme="light"] .ai-md-content code { background: rgba(0,0,0,0.06); }

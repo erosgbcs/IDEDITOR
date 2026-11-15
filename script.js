@@ -534,11 +534,20 @@ function wireTier1Features() {
 function updateStatusFont() { const el = document.getElementById('statusFont'); if (el) el.textContent = fontSize + 'px'; }
 function findTabEl(name) { return Array.from(document.querySelectorAll('.tab')).find(t => t.dataset.file === name) || null; }
 function findSideItemEl(name) { return Array.from(document.querySelectorAll('.side-item[data-file]')).find(t => t.dataset.file === name) || null; }
+function countDirtyFiles() { return filesList.reduce((n, file) => n + (((savedSnapshot[file] || '') !== (models[file] ? models[file].getValue() : '')) ? 1 : 0), 0); }
+function updateQuickGitBadge() {
+  const badge = document.getElementById('quickGitBadge');
+  if (!badge) return;
+  const dirtyCount = countDirtyFiles();
+  badge.textContent = String(dirtyCount);
+  badge.style.display = dirtyCount > 0 ? 'inline-block' : 'none';
+}
 
 function markDirtyState(file) {
   const dirty = (savedSnapshot[file] || '') !== (models[file] ? models[file].getValue() : '');
   const tab = findTabEl(file); if (tab) tab.classList.toggle('dirty', dirty);
   const item = findSideItemEl(file); if (item) item.classList.toggle('dirty', dirty);
+  updateQuickGitBadge();
 }
 
 let saveTimer = null, hasPendingSave = false;
@@ -749,6 +758,15 @@ function deleteFile(name) {
 function openSidebar() { document.getElementById('sidebar').classList.remove('hidden'); document.getElementById('sidebarBackdrop').classList.add('show'); localStorage.setItem(SIDEBAR_KEY, '0'); }
 function closeSidebar() { document.getElementById('sidebar').classList.add('hidden'); document.getElementById('sidebarBackdrop').classList.remove('show'); localStorage.setItem(SIDEBAR_KEY, '1'); }
 function toggleSidebar() { const sidebar = document.getElementById('sidebar'); if (sidebar.classList.contains('hidden')) openSidebar(); else closeSidebar(); }
+function setQuickNavActive(btnId) {
+  document.querySelectorAll('.quick-nav-btn').forEach(btn => btn.classList.toggle('active', btn.id === btnId));
+}
+function scrollSidebarSection(sectionId, quickBtnId) {
+  const section = document.getElementById(sectionId);
+  if (!section) return;
+  section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  if (quickBtnId) setQuickNavActive(quickBtnId);
+}
 
 function wireSidebar() {
   const sidebar = document.getElementById('sidebar'), toggle = document.getElementById('btnSidebarToggle'), backdrop = document.getElementById('sidebarBackdrop');
@@ -781,6 +799,23 @@ function wireSidebar() {
     }
   });
   document.getElementById('btnFirebaseLogout').addEventListener('click', () => { if (firebaseEnabled && authModule) authModule.signOut(fbAuth); });
+
+  const quickExplorer = document.getElementById('btnQuickExplorer');
+  const quickSearch = document.getElementById('btnQuickSearch');
+  const quickGit = document.getElementById('btnQuickGit');
+  const quickAccount = document.getElementById('btnQuickAccount');
+  const quickRun = document.getElementById('btnQuickRun');
+  if (quickExplorer) quickExplorer.addEventListener('click', () => scrollSidebarSection('explorerSection', 'btnQuickExplorer'));
+  if (quickSearch) quickSearch.addEventListener('click', () => {
+    setQuickNavActive('btnQuickSearch');
+    scrollSidebarSection('explorerSection');
+    const input = document.getElementById('fileFilter');
+    if (input) { input.focus(); input.select(); }
+  });
+  if (quickGit) quickGit.addEventListener('click', () => scrollSidebarSection('sourceControlSection', 'btnQuickGit'));
+  if (quickAccount) quickAccount.addEventListener('click', () => scrollSidebarSection('firebaseSection', 'btnQuickAccount'));
+  if (quickRun) quickRun.addEventListener('click', () => { setQuickNavActive('btnQuickRun'); run(); });
+  updateQuickGitBadge();
 }
 
 function switchFile(file) {

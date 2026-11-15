@@ -84,6 +84,47 @@ html[data-theme="light"] .btn:active{ background:#d4d4d4; }
 }
 .sidebar.hidden{ display:none; }
 .side-section{ display:flex; flex-direction:column; gap:4px; }
+.quick-nav{
+  display:grid;
+  grid-template-columns:repeat(5,minmax(0,1fr));
+  gap:8px;
+  padding:4px;
+  margin-bottom:4px;
+  border-bottom:1px solid var(--border);
+}
+.quick-nav-btn{
+  position:relative;
+  display:inline-flex; align-items:center; justify-content:center;
+  width:100%; height:42px;
+  color:#9da7b8;
+  background:transparent;
+  border:1px solid transparent;
+  border-radius:10px;
+  cursor:pointer;
+  transition:background .12s,border-color .12s,color .12s;
+}
+.quick-nav-btn:hover{ background:rgba(255,255,255,.06); color:#dce6f5; }
+.quick-nav-btn.active{
+  color:#fff;
+  border-color:rgba(10,132,255,.35);
+  background:rgba(10,132,255,.15);
+}
+.quick-nav-btn#btnQuickRun{ color:#4ade80; }
+.quick-badge{
+  position:absolute;
+  right:6px;
+  top:5px;
+  min-width:16px;
+  height:16px;
+  padding:0 4px;
+  border-radius:999px;
+  font-size:10px;
+  line-height:16px;
+  text-align:center;
+  color:#fff;
+  background:#2563eb;
+  display:none;
+}
 .side-head{
   font-size:10.5px; font-weight:700; letter-spacing:.8px;
   color:#888; text-transform:uppercase; padding:4px 8px;
@@ -696,6 +737,18 @@ html[data-theme="light"] .side-grid .side-item {
 html[data-theme="light"] .side-grid .side-item:hover {
   background: #e0e0e0;
   border-color: #aaa;
+}
+html[data-theme="light"] .quick-nav-btn{
+  color:#4a5568;
+}
+html[data-theme="light"] .quick-nav-btn:hover{
+  background:rgba(0,0,0,.06);
+  color:#1f2937;
+}
+html[data-theme="light"] .quick-nav-btn.active{
+  color:#003366;
+  border-color:rgba(0,102,204,.35);
+  background:rgba(0,102,204,.12);
 }
 
 /* 3. Fix the Git Status text (e.g., "Clean" or "Connected") */

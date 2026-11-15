@@ -42,7 +42,25 @@
       <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
 
       <aside class="sidebar" id="sidebar">
-        <div class="side-section">
+        <div class="quick-nav" aria-label="Workspace quick actions">
+          <button class="quick-nav-btn" id="btnQuickRun" title="Run Preview" aria-label="Run">
+            <svg viewBox="0 0 24 24" width="20" height="20"><path d="M7 5l12 7-12 7V5z" fill="currentColor"/></svg>
+          </button>
+          <button class="quick-nav-btn active" id="btnQuickExplorer" title="Explorer" aria-label="Explorer">
+            <svg viewBox="0 0 24 24" width="20" height="20"><path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-8l-2-2H5a2 2 0 0 0-2 2z" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linejoin="round"/></svg>
+          </button>
+          <button class="quick-nav-btn" id="btnQuickSearch" title="Search files" aria-label="Search files">
+            <svg viewBox="0 0 24 24" width="20" height="20"><circle cx="11" cy="11" r="6.5" stroke="currentColor" stroke-width="1.8" fill="none"/><path d="M16 16l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </button>
+          <button class="quick-nav-btn" id="btnQuickGit" title="Source control" aria-label="Source control">
+            <svg viewBox="0 0 24 24" width="20" height="20"><path d="M6 6v12M6 6l12 6-12 6" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span class="quick-badge" id="quickGitBadge">0</span>
+          </button>
+          <button class="quick-nav-btn" id="btnQuickAccount" title="Cloud account" aria-label="Cloud account">
+            <svg viewBox="0 0 24 24" width="20" height="20"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="1.8" fill="none"/><path d="M4 20a8 8 0 0 1 16 0" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+        <div class="side-section" id="explorerSection">
           <div class="side-head">Explorer</div>
           <label class="file-filter">
             <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><circle cx="11" cy="11" r="6.5" stroke="currentColor" stroke-width="1.8" fill="none"/><path d="M16 16l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
@@ -68,7 +86,7 @@
         </div>
 
         <!-- Refactored Firebase Section -->
-        <div class="side-section firebase-section">
+        <div class="side-section firebase-section" id="firebaseSection">
           <div class="side-head">Firebase Cloud</div>
           
           <!-- Logged Out View -->
@@ -102,7 +120,7 @@
         </div>
 
         <!-- Refactored Source Control Section -->
-        <div class="side-section">
+        <div class="side-section" id="sourceControlSection">
           <div class="side-head" style="display: flex; justify-content: space-between; align-items: center;">
             <span>Source Control</span>
             <button class="icon-btn sm" id="btnGitSettings" title="Git Settings" style="width: 24px; height: 24px; background: transparent; border: none; padding: 0;">

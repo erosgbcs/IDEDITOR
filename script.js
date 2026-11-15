@@ -1395,6 +1395,7 @@ function wireAI() {
     editor,
     models,
     getActiveFile: () => activeFile,
+    switchFile: (file) => switchFile(file),
     legacy: { providerKey: AI_PROVIDER_KEY, apiKey: AI_KEY_KEY, modelKey: AI_MODEL_KEY }
   };
   if (!window.AIAgents || typeof window.AIAgents.attach !== 'function') {

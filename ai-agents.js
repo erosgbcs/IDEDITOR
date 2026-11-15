@@ -46,6 +46,28 @@
     openrouter: 'OpenRouter', fireworks: 'Fireworks', mistral: 'Mistral',
     ollama: 'Ollama', custom: 'Custom', mock: 'Mock'
   };
+  const WORKFLOWS = [
+    {
+      id: 'fix-current',
+      label: 'Fix Current File',
+      prompt: 'Find and fix problems in the active file. Return a single final code block for that file only.'
+    },
+    {
+      id: 'refactor-current',
+      label: 'Refactor Current File',
+      prompt: 'Refactor the active file for readability and maintainability without changing behavior. Return only one final code block.'
+    },
+    {
+      id: 'add-feature',
+      label: 'Implement Feature',
+      prompt: 'Implement the requested feature cleanly. Return complete updated code block(s) with clear file targeting.'
+    },
+    {
+      id: 'explain-code',
+      label: 'Explain Current File',
+      prompt: 'Explain the active file structure, key logic, and risky areas briefly with actionable suggestions.'
+    }
+  ];
   const PRESETS = {
     openai: ['https://api.openai.com/v1', ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'o3-mini']],
     groq: ['https://api.groq.com/openai/v1', ['llama-3.1-8b-instant', 'llama-3.3-70b-versatile', 'openai/gpt-oss-120b', 'moonshotai/kimi-k2-instruct']],
@@ -93,6 +115,64 @@
   const toast = (msg) => { if (typeof window.showToast === 'function') window.showToast(msg); };
   const readJson = (key, fb) => { try { const v = JSON.parse(localStorage.getItem(key)); return v == null ? fb : v; } catch (_) { return fb; } };
   const writeJson = (key, v) => localStorage.setItem(key, JSON.stringify(v));
+  const basename = (p) => text(p).split('/').pop();
+
+  function parseCodeTargetFromContent(rawCode) {
+    const src = text(rawCode);
+    const m = src.match(/^\s*(?:\/\/|#|<!--|\/\*)?\s*(?:file|filename)\s*[:=]\s*([^\s*]+)\s*(?:\*\/|-->)*\s*\n/i);
+    if (!m) return { code: src, targetFile: '' };
+    return { code: src.slice(m[0].length), targetFile: text(m[1]).trim() };
+  }
+
+  function parseFenceHint(value) {
+    const hint = text(value).trim().toLowerCase();
+    if (!hint) return { targetFile: '', langHint: '' };
+    if (hint.includes('.')) return { targetFile: hint, langHint: '' };
+    return { targetFile: '', langHint: hint };
+  }
+
+  function pickFileByLanguage(langHint) {
+    const models = context?.models || {};
+    const files = Object.keys(models);
+    if (!files.length) return '';
+    const active = context?.getActiveFile?.() || '';
+    const byName = (name) => files.find((f) => f.toLowerCase() === name.toLowerCase()) || '';
+    const byExt = (exts) => files.find((f) => exts.some((ext) => f.toLowerCase().endsWith(ext))) || '';
+    const lower = text(langHint).toLowerCase();
+    if (!lower) return '';
+
+    if (['js', 'javascript', 'node', 'jsx', 'typescript', 'ts', 'tsx'].includes(lower)) {
+      if (active && /\.(js|jsx|ts|tsx)$/i.test(active)) return active;
+      return byName('script.js') || byName('index.js') || byExt(['.js', '.jsx', '.ts', '.tsx']);
+    }
+    if (['css', 'scss', 'sass', 'less'].includes(lower)) {
+      if (active && /\.(css|scss|sass|less)$/i.test(active)) return active;
+      return byName('style.css') || byExt(['.css', '.scss', '.sass', '.less']);
+    }
+    if (['html', 'htm', 'xml'].includes(lower)) {
+      if (active && /\.(html|htm|xml)$/i.test(active)) return active;
+      return byName('index.html') || byExt(['.html', '.htm', '.xml']);
+    }
+    if (['json'].includes(lower)) return byExt(['.json']);
+    if (['md', 'markdown'].includes(lower)) return byExt(['.md']);
+    return '';
+  }
+
+  function resolveTargetFile(preferredFile, langHint) {
+    const models = context?.models || {};
+    const files = Object.keys(models);
+    const active = context?.getActiveFile?.();
+    if (!files.length) return '';
+    if (preferredFile) {
+      if (models[preferredFile]) return preferredFile;
+      const exactBasename = files.find((f) => basename(f).toLowerCase() === basename(preferredFile).toLowerCase());
+      if (exactBasename) return exactBasename;
+    }
+    const fromLang = pickFileByLanguage(langHint);
+    if (fromLang) return fromLang;
+    if (active && models[active]) return active;
+    return files[0];
+  }
 
   // ─── Agent model ───────────────────────────────────────────
   function normalizeAgent(agent) {
@@ -265,11 +345,17 @@
   // ─── Apply / Keep / Discard ────────────────────────────────
   // Applies AI-generated code to the active model and turns the block's
   // action row into Keep / Discard buttons.
-  function applyCodeAsSuggestion(code, block) {
-    const file = context?.getActiveFile?.();
-    const model = file && context.models[file];
+  function applyCodeAsSuggestion(code, block, hints) {
+    const parsed = parseCodeTargetFromContent(code);
+    const preferredFile = text(hints?.targetFile || parsed.targetFile);
+    const langHint = text(hints?.langHint);
+    const file = resolveTargetFile(preferredFile, langHint);
+    const model = file && context?.models && context.models[file];
     if (!model) { toast('No active file'); return; }
     if (model.isDisposed && model.isDisposed()) { toast('File no longer open'); return; }
+    if (typeof context?.switchFile === 'function' && file !== context.getActiveFile?.()) {
+      try { context.switchFile(file); } catch (_) {}
+    }
 
     const originalContent = model.getValue();
     const originalFile = file;
@@ -289,11 +375,11 @@
       appliedVersion: model.getAlternativeVersionId()
     };
 
-    renderKeepDiscardButtons(block, pendingState, code);
-    toast('Change applied — Keep or Discard');
+    renderKeepDiscardButtons(block, pendingState, parsed.code, hints);
+    toast('Change applied to ' + basename(originalFile) + ' — Keep or Discard');
   }
 
-  function renderKeepDiscardButtons(block, pendingState, code) {
+  function renderKeepDiscardButtons(block, pendingState, code, hints) {
     const actions = block.querySelector('.ai-code-actions');
     if (!actions) return;
     actions.innerHTML = '';
@@ -315,7 +401,7 @@
     discardBtn.textContent = '✗ Discard';
     discardBtn.onclick = () => {
       if (pendingState.model.isDisposed && pendingState.model.isDisposed()) {
-        restoreApplyButton(actions, code);
+        restoreApplyButton(actions, code, hints);
         return;
       }
 
@@ -336,19 +422,19 @@
       );
       pendingState.model.pushStackElement();
 
-      restoreApplyButton(actions, code);
+      restoreApplyButton(actions, code, hints);
       toast('Change discarded');
     };
 
     actions.append(keepBtn, discardBtn);
   }
 
-  function restoreApplyButton(actions, code) {
+  function restoreApplyButton(actions, code, hints) {
     actions.innerHTML = '';
     const applyBtn = document.createElement('button');
     applyBtn.className = 'btn primary';
     applyBtn.textContent = '⚡ Apply to Editor';
-    applyBtn.onclick = () => applyCodeAsSuggestion(code, applyBtn.closest('.ai-code-block'));
+    applyBtn.onclick = () => applyCodeAsSuggestion(code, applyBtn.closest('.ai-code-block'), hints || {});
     actions.appendChild(applyBtn);
   }
 
@@ -377,6 +463,8 @@
     // Inject Apply buttons into code blocks
     contentDiv.querySelectorAll('pre code').forEach((codeEl) => {
       const code = codeEl.textContent;
+      const fenceInfo = parseFenceHint((codeEl.className.match(/language-([^\s]+)/i) || [])[1]);
+      const parsedCode = parseCodeTargetFromContent(code);
       const pre = codeEl.parentElement;
       
       // Apply syntax highlighting
@@ -391,7 +479,10 @@
       const applyBtn = document.createElement('button');
       applyBtn.className = 'btn primary';
       applyBtn.textContent = '⚡ Apply to Editor';
-      applyBtn.onclick = () => applyCodeAsSuggestion(code, block);
+      applyBtn.onclick = () => applyCodeAsSuggestion(parsedCode.code, block, {
+        targetFile: fenceInfo.targetFile || parsedCode.targetFile,
+        langHint: fenceInfo.langHint
+      });
       actions.appendChild(applyBtn);
       
       pre.replaceWith(block);
@@ -404,17 +495,24 @@
     const parts = text(value).split(/(```[\s\S]*?```)/g);
     parts.forEach((part) => {
       if (part.startsWith('```') && part.endsWith('```')) {
-        const code = part.slice(3, -3).replace(/^[a-zA-Z0-9_-]+\n/, '');
+        const matched = part.match(/^```([^\n]*)\n([\s\S]*?)```$/);
+        const fenceRaw = matched ? matched[1] : '';
+        const inner = matched ? matched[2] : part.slice(3, -3);
+        const fenceInfo = parseFenceHint(fenceRaw);
+        const parsedCode = parseCodeTargetFromContent(inner);
         const block = document.createElement('div');
         block.className = 'ai-code-block';
         const pre = document.createElement('pre');
-        pre.textContent = code;
+        pre.textContent = parsedCode.code;
         const actions = document.createElement('div');
         actions.className = 'ai-code-actions';
         const applyBtn = document.createElement('button');
         applyBtn.className = 'btn primary';
         applyBtn.textContent = '⚡ Apply to Editor';
-        applyBtn.onclick = () => applyCodeAsSuggestion(code, block);
+        applyBtn.onclick = () => applyCodeAsSuggestion(parsedCode.code, block, {
+          targetFile: fenceInfo.targetFile || parsedCode.targetFile,
+          langHint: fenceInfo.langHint
+        });
         actions.appendChild(applyBtn);
         block.append(pre, actions);
         div.appendChild(block);
@@ -544,6 +642,12 @@
     if (!prompt) return;
     input.value = '';
     input.style.height = '36px';
+    await sendPrompt(prompt);
+  }
+
+  async function sendPrompt(prompt, opts) {
+    opts = opts || {};
+    const displayText = opts.displayText || prompt;
 
     const agents = selectedAgents();
     if (!agents.length) {
@@ -551,7 +655,7 @@
       return;
     }
 
-    renderMessage('user', prompt);
+    renderMessage('user', displayText);
 
     try {
       if (state.mode === 'single') await runSingle(prompt, agents);
@@ -593,6 +697,22 @@
     manage.className = 'btn';
     manage.textContent = 'Manage Agents ⚙';
 
+    const workflow = document.createElement('select');
+    workflow.className = 'git-input ai-workflow-select';
+    const workflowPlaceholder = document.createElement('option');
+    workflowPlaceholder.value = '';
+    workflowPlaceholder.textContent = 'Workflow…';
+    workflow.appendChild(workflowPlaceholder);
+    WORKFLOWS.forEach((wf) => {
+      const opt = document.createElement('option');
+      opt.value = wf.id;
+      opt.textContent = wf.label;
+      workflow.appendChild(opt);
+    });
+    const runWorkflow = document.createElement('button');
+    runWorkflow.className = 'btn';
+    runWorkflow.textContent = 'Run Workflow';
+
     const clear = document.createElement('button');
     clear.className = 'btn';
     clear.textContent = 'Clear';
@@ -602,7 +722,7 @@
     stopButton.textContent = 'Stop';
     stopButton.style.display = 'none';
 
-    toolbar.append(picker, mode, manage, clear, stopButton);
+    toolbar.append(picker, mode, workflow, runWorkflow, manage, clear, stopButton);
     panel.insertBefore(toolbar, messagesEl);
     mode.value = state.mode;
 
@@ -677,6 +797,24 @@
     };
 
     manage.onclick = () => openModal('agents');
+    runWorkflow.onclick = async () => {
+      const selected = WORKFLOWS.find((wf) => wf.id === workflow.value);
+      if (!selected) return toast('Select a workflow');
+      const file = context?.getActiveFile?.() || 'active file';
+      const input = get('aiInput');
+      const extra = input && input.value.trim() ? ('\n\nUser details:\n' + input.value.trim()) : '';
+      if (input) {
+        input.value = '';
+        input.style.height = '36px';
+      }
+      await sendPrompt(
+        'Workflow: ' + selected.label + '\n'
+        + selected.prompt + '\n'
+        + 'Active file: ' + file + '.'
+        + extra,
+        { displayText: 'Workflow → ' + selected.label + ' (' + basename(file) + ')' }
+      );
+    };
     clear.onclick = clearMessages;
     stopButton.onclick = stopRequests;
 
